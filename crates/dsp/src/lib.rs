@@ -1,8 +1,10 @@
-//! SYNTHRACE real-time synth engine (M0 spike).
+//! SYNTHRACE real-time synth engine: music (M0 spike loop) plus game sound effects.
 //!
 //! Rules: no allocation, locking or panicking in `process`; all state is fixed-size.
-//! The M0 spike sequences a short i–VI–III–VII loop internally to prove quality and
-//! timing; from M3 the `music` conductor drives voices with timestamped events.
+//! The music sequences a short i–VI–III–VII loop internally; from M3 the `music`
+//! conductor drives voices with timestamped events.
+
+pub mod sfx;
 
 use core::f32::consts::TAU;
 
@@ -13,6 +15,14 @@ pub mod param {
     /// Game speed 0..1: opens the music filter and enables layers.
     pub const SPEED: u32 = 1;
     pub const MUTE: u32 = 2;
+    pub const RPM: u32 = 3;
+    pub const THROTTLE: u32 = 4;
+    pub const SLIP: u32 = 5;
+    pub const NITRO: u32 = 6;
+    /// Traffic voice i uses TRAFFIC + 3·i (gain 0..1), +1 (pitch Hz), +2 (pan −1..1).
+    pub const TRAFFIC: u32 = 7;
+    pub const MUSIC_GAIN: u32 = 19;
+    pub const SFX_GAIN: u32 = 20;
 }
 
 const BPM: f32 = 118.0;
@@ -45,13 +55,13 @@ fn poly_blep(t: f32, dt: f32) -> f32 {
 }
 
 #[derive(Clone, Copy, Default)]
-struct Saw {
-    phase: f32,
+pub(crate) struct Saw {
+    pub(crate) phase: f32,
 }
 
 impl Saw {
     #[inline]
-    fn next(&mut self, dt: f32) -> f32 {
+    pub(crate) fn next(&mut self, dt: f32) -> f32 {
         let v = 2.0 * self.phase - 1.0 - poly_blep(self.phase, dt);
         self.phase += dt;
         if self.phase >= 1.0 {
@@ -63,38 +73,49 @@ impl Saw {
 
 /// Topology-preserving-transform state-variable filter (Cytomic / Zavalishin), low-pass output.
 #[derive(Clone, Copy, Default)]
-struct Svf {
+pub(crate) struct Svf {
     ic1: f32,
     ic2: f32,
 }
 
 impl Svf {
     #[inline]
-    fn lp(&mut self, x: f32, g: f32, k: f32) -> f32 {
+    pub(crate) fn lp(&mut self, x: f32, g: f32, k: f32) -> f32 {
+        self.tick(x, g, k).1
+    }
+
+    /// Band-pass output; `k` = 1/Q (smaller is more resonant).
+    #[inline]
+    pub(crate) fn bp(&mut self, x: f32, g: f32, k: f32) -> f32 {
+        self.tick(x, g, k).0
+    }
+
+    #[inline]
+    fn tick(&mut self, x: f32, g: f32, k: f32) -> (f32, f32) {
         let a1 = 1.0 / (1.0 + g * (g + k));
         let v3 = x - self.ic2;
         let v1 = a1 * self.ic1 + g * a1 * v3;
         let v2 = self.ic2 + g * v1;
         self.ic1 = flush(2.0 * v1 - self.ic1);
         self.ic2 = flush(2.0 * v2 - self.ic2);
-        v2
+        (v1, v2)
     }
 }
 
 #[inline]
-fn flush(x: f32) -> f32 {
+pub(crate) fn flush(x: f32) -> f32 {
     if x.abs() < 1e-20 { 0.0 } else { x }
 }
 
 #[inline]
-fn svf_g(cutoff: f32, sr: f32) -> f32 {
+pub(crate) fn svf_g(cutoff: f32, sr: f32) -> f32 {
     (core::f32::consts::PI * (cutoff / sr).min(0.45)).tan()
 }
 
-struct Rng(u32);
+pub(crate) struct Rng(pub(crate) u32);
 impl Rng {
     #[inline]
-    fn next(&mut self) -> f32 {
+    pub(crate) fn next(&mut self) -> f32 {
         self.0 ^= self.0 << 13;
         self.0 ^= self.0 >> 17;
         self.0 ^= self.0 << 5;
@@ -104,16 +125,16 @@ impl Rng {
 
 /// One-pole parameter smoother.
 #[derive(Clone, Copy)]
-struct Smooth {
+pub(crate) struct Smooth {
     v: f32,
     coef: f32,
 }
 impl Smooth {
-    fn new(v: f32, time_s: f32, sr: f32) -> Self {
+    pub(crate) fn new(v: f32, time_s: f32, sr: f32) -> Self {
         Self { v, coef: 1.0 - (-1.0 / (time_s * sr)).exp() }
     }
     #[inline]
-    fn step(&mut self, target: f32) -> f32 {
+    pub(crate) fn step(&mut self, target: f32) -> f32 {
         self.v += (target - self.v) * self.coef;
         self.v
     }
@@ -147,6 +168,11 @@ pub struct Synth {
     arp_t: f32,
     rng: Rng,
     duck: f32,
+    music_gain: f32,
+    sfx_gain: f32,
+    traffic_params: [f32; 3 * sfx::TRAFFIC_VOICES],
+    chord: [u8; PAD_VOICES],
+    pub sfx: sfx::Sfx,
     pub out_l: [f32; BLOCK],
     pub out_r: [f32; BLOCK],
 }
@@ -186,6 +212,11 @@ impl Synth {
             arp_t: 10.0,
             rng,
             duck: 0.0,
+            music_gain: 0.6,
+            sfx_gain: 1.0,
+            traffic_params: [0.0; 3 * sfx::TRAFFIC_VOICES],
+            chord: PROGRESSION[0].0,
+            sfx: sfx::Sfx::new(sr),
             out_l: [0.0; BLOCK],
             out_r: [0.0; BLOCK],
         }
@@ -199,7 +230,35 @@ impl Synth {
             param::MASTER => self.master = v.clamp(0.0, 1.0),
             param::SPEED => self.speed = v.clamp(0.0, 1.0),
             param::MUTE => self.muted = v > 0.5,
+            param::RPM => self.sfx.set_rpm(v),
+            param::THROTTLE => self.sfx.set_throttle(v),
+            param::SLIP => self.sfx.set_slip(v),
+            param::NITRO => self.sfx.set_nitro(v),
+            param::MUSIC_GAIN => self.music_gain = v.clamp(0.0, 1.0),
+            param::SFX_GAIN => self.sfx_gain = v.clamp(0.0, 1.0),
+            id if (param::TRAFFIC..param::TRAFFIC + 3 * sfx::TRAFFIC_VOICES as u32).contains(&id) => {
+                let k = (id - param::TRAFFIC) as usize;
+                self.traffic_params[k] = v;
+                let i = k / 3;
+                let t = &self.traffic_params[i * 3..i * 3 + 3];
+                self.sfx.set_traffic(i, t[0], t[1], t[2]);
+            }
             _ => {}
+        }
+    }
+
+    /// Starts a one-shot effect (see [`sfx::shot`]). For `BLIP`, `value` is a combo step and
+    /// the pitch is chosen from the current chord so accents always fit the music.
+    pub fn trigger(&mut self, kind: u32, value: f32) {
+        if !value.is_finite() {
+            return;
+        }
+        if kind == sfx::shot::BLIP {
+            let step = value.max(0.0) as usize;
+            let note = self.chord[step % PAD_VOICES] as f32 + 24.0 + 12.0 * ((step / PAD_VOICES) % 2) as f32;
+            self.sfx.trigger(kind, midi_hz(note));
+        } else {
+            self.sfx.trigger(kind, value);
         }
     }
 
@@ -230,6 +289,7 @@ impl Synth {
             let step = step_f as usize;
             let in_step = in_bar - step as f32 * step_len;
             let (chord, root) = PROGRESSION[bar % PROGRESSION.len()];
+            self.chord = chord;
 
             // Triggers on step boundaries.
             if in_step < 1.0 {
@@ -299,8 +359,13 @@ impl Synth {
             let arp = self.arp_filt.lp(a, svf_g(400.0 + aenv * 4500.0, sr), 1.0) * aenv * 0.09 * arp_g;
             self.arp_t += inv_sr;
 
-            let l = pl + bass + kick + hat * 0.8 + arp * 0.7;
-            let r = pr + bass + kick + hat * 1.0 + arp * 1.0;
+            let mg = self.music_gain;
+            let mut l = (pl + bass + kick + hat * 0.8 + arp * 0.7) * mg;
+            let mut r = (pr + bass + kick + hat * 1.0 + arp * 1.0) * mg;
+            let (mut el, mut er) = (0.0f32, 0.0f32);
+            self.sfx.sample(&mut el, &mut er);
+            l += el * self.sfx_gain;
+            r += er * self.sfx_gain;
             // Gentle tape-style saturation on the master bus.
             self.out_l[i] = (l * 1.2).tanh() * 0.8 * master;
             self.out_r[i] = (r * 1.2).tanh() * 0.8 * master;
@@ -353,6 +418,71 @@ mod tests {
         // High-frequency energy proxy: RMS of the first difference.
         let hf = |x: &[f32]| rms(&x.windows(2).map(|w| w[1] - w[0]).collect::<Vec<_>>());
         assert!(hf(&fast[48_000..]) > 2.0 * hf(&slow[48_000..]));
+    }
+
+    #[test]
+    fn engine_pitch_follows_rpm() {
+        // Music off, engine only: count zero crossings of the low-passed engine signal.
+        let crossings = |rpm: f32| {
+            let mut s = Synth::new(48_000.0);
+            s.set_param(param::MUSIC_GAIN, 0.0);
+            s.set_param(param::RPM, rpm);
+            s.set_param(param::THROTTLE, 0.6);
+            let mut out = Vec::new();
+            for _ in 0..(48_000 / BLOCK) {
+                s.process(BLOCK);
+                out.extend_from_slice(&s.out_l);
+            }
+            out[12_000..].windows(2).filter(|w| w[0] < 0.0 && w[1] >= 0.0).count()
+        };
+        let low = crossings(1500.0);
+        let high = crossings(6000.0);
+        assert!(high as f32 > low as f32 * 2.5, "low {low} high {high}");
+    }
+
+    #[test]
+    fn all_effects_together_stay_finite_and_bounded() {
+        let mut s = Synth::new(44_100.0);
+        s.set_param(param::SPEED, 1.0);
+        s.set_param(param::RPM, 7400.0);
+        s.set_param(param::THROTTLE, 1.0);
+        s.set_param(param::SLIP, 1.0);
+        s.set_param(param::NITRO, 1.0);
+        for i in 0..4u32 {
+            s.set_param(param::TRAFFIC + 3 * i, 1.0);
+            s.set_param(param::TRAFFIC + 3 * i + 1, 120.0 + 30.0 * i as f32);
+            s.set_param(param::TRAFFIC + 3 * i + 2, if i % 2 == 0 { -1.0 } else { 1.0 });
+        }
+        for b in 0..3000 {
+            if b % 40 == 0 {
+                for k in 0..5 {
+                    s.trigger(k, 1.0);
+                }
+            }
+            s.process(BLOCK);
+            for x in s.out_l.iter().chain(s.out_r.iter()) {
+                assert!(x.is_finite() && x.abs() <= 1.0);
+                assert!(*x == 0.0 || x.abs() > 1e-30, "denormal");
+            }
+        }
+    }
+
+    #[test]
+    fn one_shots_decay_to_silence() {
+        let mut s = Synth::new(48_000.0);
+        s.set_param(param::MUSIC_GAIN, 0.0);
+        s.set_param(param::RPM, 600.0);
+        s.set_param(param::THROTTLE, 0.0);
+        s.set_param(param::SFX_GAIN, 1.0);
+        for k in 0..5 {
+            s.trigger(k, 1.0);
+        }
+        for _ in 0..(48_000 / BLOCK) {
+            s.process(BLOCK);
+        }
+        // Only the idle engine remains: quiet.
+        let peak = s.out_l.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        assert!(peak < 0.25, "peak {peak}");
     }
 
     #[test]

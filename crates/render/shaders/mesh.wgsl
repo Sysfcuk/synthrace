@@ -17,6 +17,7 @@ struct MeshOut {
     @location(2) color: vec3f,
     @location(3) emissive: f32,
     @location(4) height: f32,
+    @location(5) lights: vec2f, // brake 0..1, indicator signal −1/0/+1
 }
 
 fn rot_y(v: vec3f, a: f32) -> vec3f {
@@ -44,6 +45,7 @@ fn vs_mesh(in: MeshIn) -> MeshOut {
     o.color = in.color;
     o.emissive = in.emissive;
     o.height = local.y + in.i_pos_yaw.y;
+    o.lights = in.i_scale_roll.zw;
     return o;
 }
 
@@ -52,6 +54,18 @@ fn fs_mesh(in: MeshOut) -> @location(0) vec4f {
     if (in.emissive < -0.5) {
         // Contact shadow: darken toward black, fogged like everything else.
         return vec4f(apply_fog(vec3f(0.002, 0.0, 0.006), in.rel, 0.0), 1.0);
+    }
+    var emissive = in.emissive;
+    if (emissive > 49.5) {
+        // Per-instance light markers (see procgen::marker).
+        let code = round(emissive);
+        let blink = step(0.5, fract(frame.cam.w * 1.6));
+        if (code == 50.0) {
+            emissive = 1.6 + 6.0 * in.lights.x;
+        } else {
+            let side = select(1.0, -1.0, code == 51.0);
+            emissive = select(0.0, 9.0 * blink, in.lights.y * side > 0.5);
+        }
     }
     let dist = length(in.rel);
     let v = -in.rel / max(dist, 1e-3);
@@ -72,7 +86,8 @@ fn fs_mesh(in: MeshOut) -> @location(0) vec4f {
     // Glossy sky reflection on upward faces (car body, roof).
     let refl = reflect(-v, n);
     let gloss = sky_color(refl) * 0.12 * smoothstep(0.0, 0.6, n.y);
-    var c = in.color * (amb + key) + rim_col * rim * 1.3 + gloss * (1.0 - in.emissive * 0.1) + in.color * in.emissive;
+    let lit = select(1.0, 0.0, emissive > 0.5);
+    var c = (in.color * (amb + key) + rim_col * rim * 1.3 + gloss) * lit + in.color * emissive;
     c = apply_fog(c, in.rel, in.height);
     return vec4f(c, 1.0);
 }

@@ -9,10 +9,12 @@ const SOURCES: &[(&str, &str)] = &[
     ("bloom_up.wgsl", include_str!("../shaders/bloom_up.wgsl")),
     ("composite.wgsl", include_str!("../shaders/composite.wgsl")),
     ("mesh.wgsl", include_str!("../shaders/mesh.wgsl")),
+    ("particles.wgsl", include_str!("../shaders/particles.wgsl")),
 ];
 
 /// Top-level shader modules (each becomes one `wgpu::ShaderModule`).
-pub const MODULES: &[&str] = &["sky.wgsl", "ground.wgsl", "bloom_down.wgsl", "bloom_up.wgsl", "composite.wgsl", "mesh.wgsl"];
+pub const MODULES: &[&str] =
+    &["sky.wgsl", "ground.wgsl", "bloom_down.wgsl", "bloom_up.wgsl", "composite.wgsl", "mesh.wgsl", "particles.wgsl"];
 
 fn raw(name: &str) -> &'static str {
     SOURCES.iter().find(|(n, _)| *n == name).map(|(_, s)| *s).unwrap_or_else(|| panic!("unknown shader source {name}"))

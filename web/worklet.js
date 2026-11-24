@@ -12,7 +12,10 @@ class SynthProcessor extends AudioWorkletProcessor {
     this.buf = null;
     this.port.onmessage = (e) => {
       const d = e.data;
-      if (d && d.t === "p") this.dsp.set_param(d.id, d.v);
+      if (!d) return;
+      if (d.t === "p") this.dsp.set_param(d.id, d.v);
+      else if (d.t === "pp") for (let i = 0; i < d.v.length; i++) this.dsp.set_param(d.id + i, d.v[i]);
+      else if (d.t === "e") this.dsp.trigger(d.k, d.v);
     };
   }
 

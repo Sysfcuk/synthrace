@@ -125,47 +125,11 @@ pub fn car(style: &CarStyle) -> Mesh {
         [4.45, 0.80, 0.30, 0.52, 0.54, 0.62],
     ];
     let zc = CAR_LENGTH * 0.5;
-    let ring = |s: &[f32; 6]| -> [V3; 8] {
-        let [z, hw, b, sh, roof, rhw] = *s;
-        let z = z - zc;
-        let low = b + (sh - b) * 0.45;
-        [
-            [-hw * 0.88, b, z],
-            [-hw, low, z],
-            [-hw, sh, z],
-            [-rhw, roof, z],
-            [rhw, roof, z],
-            [hw, sh, z],
-            [hw, low, z],
-            [hw * 0.88, b, z],
-        ]
-    };
     let body = Material { color: style.body, emissive: 0.0 };
     let glass = Material { color: style.glass, emissive: 0.15 };
     let mut m = Mesh::default();
-    // Contact shadow: a flat quad just above the road; negative emissive marks it as a shadow.
-    let shadow = Material { color: [0.0, 0.0, 0.0], emissive: -1.0 };
-    m.quad([-1.08, 0.015, -zc - 0.25], [-1.08, 0.015, zc + 0.2], [1.08, 0.015, zc + 0.2], [1.08, 0.015, -zc - 0.25], shadow);
-    for i in 0..ST.len() - 1 {
-        let a = ring(&ST[i]);
-        let b = ring(&ST[i + 1]);
-        for e in 0..8 {
-            let f = (e + 1) % 8;
-            // Glass: side windows over the cabin, rear window and windscreen on the roof edge.
-            let side_glass = (e == 2 || e == 4) && (3..=4).contains(&i);
-            let roof_glass = e == 3 && (i == 2 || i == 4);
-            let mat = if side_glass || roof_glass { glass } else { body };
-            // Winding: outward-facing when viewed from outside.
-            m.quad(a[e], b[e], b[f], a[f], mat);
-        }
-    }
-    // End caps (convex fans).
-    let rear = ring(&ST[0]);
-    let front = ring(&ST[ST.len() - 1]);
-    for k in 1..7 {
-        m.tri(rear[0], rear[k + 1], rear[k], body);
-        m.tri(front[0], front[k], front[k + 1], body);
-    }
+    shadow(&mut m, 1.08, zc);
+    hull(&mut m, &ST, zc, body, glass, 3..=4, &[2, 4]);
     // HDR tail-light bar across the rear face, plus a slim centre light.
     let tl = Material { color: style.tail_light, emissive: 7.0 };
     m.cuboid([-0.78, 0.60, -zc - 0.03], [0.78, 0.70, -zc + 0.01], tl);
@@ -181,6 +145,178 @@ pub fn car(style: &CarStyle) -> Mesh {
     let rim = Material { color: style.neon, emissive: 1.2 };
     for (wx, wz) in [(-0.9, 0.8), (0.9, 0.8), (-0.9, 3.55), (0.9, 3.55)] {
         wheel(&mut m, [wx, 0.33, wz - zc], 0.33, 0.26, tyre, rim);
+    }
+    m
+}
+
+/// Contact shadow: a flat quad just above the road; negative emissive marks it as a shadow.
+fn shadow(m: &mut Mesh, hw: f32, hl: f32) {
+    let sh = Material { color: [0.0, 0.0, 0.0], emissive: -1.0 };
+    let (w, l) = (hw + 0.12, hl + 0.2);
+    m.quad([-w, 0.015, -l - 0.05], [-w, 0.015, l], [w, 0.015, l], [w, 0.015, -l - 0.05], sh);
+}
+
+/// Lofted 8-sided hull through `st` stations `[z, half width, bottom, shoulder, roof, roof half width]`.
+/// Edges 2/4 within `side_glass` segments and edge 3 on `roof_glass` segments use the glass material.
+fn hull(
+    m: &mut Mesh,
+    st: &[[f32; 6]],
+    zc: f32,
+    body: Material,
+    glass: Material,
+    side_glass: core::ops::RangeInclusive<usize>,
+    roof_glass: &[usize],
+) {
+    let ring = |s: &[f32; 6]| -> [V3; 8] {
+        let [z, hw, b, sh, roof, rhw] = *s;
+        let z = z - zc;
+        let low = b + (sh - b) * 0.45;
+        [
+            [-hw * 0.88, b, z],
+            [-hw, low, z],
+            [-hw, sh, z],
+            [-rhw, roof, z],
+            [rhw, roof, z],
+            [hw, sh, z],
+            [hw, low, z],
+            [hw * 0.88, b, z],
+        ]
+    };
+    for i in 0..st.len() - 1 {
+        let a = ring(&st[i]);
+        let b = ring(&st[i + 1]);
+        for e in 0..8 {
+            let f = (e + 1) % 8;
+            let is_glass = ((e == 2 || e == 4) && side_glass.contains(&i)) || (e == 3 && roof_glass.contains(&i));
+            m.quad(a[e], b[e], b[f], a[f], if is_glass { glass } else { body });
+        }
+    }
+    let rear = ring(&st[0]);
+    let front = ring(&st[st.len() - 1]);
+    for k in 1..7 {
+        m.tri(rear[0], rear[k + 1], rear[k], body);
+        m.tri(front[0], front[k], front[k + 1], body);
+    }
+}
+
+/// Emissive marker codes interpreted per instance by the mesh shader.
+pub mod marker {
+    /// Brake light: dim running light, bright when the instance's brake value is 1.
+    pub const BRAKE: f32 = 50.0;
+    /// Left / right indicator: blink when the instance's indicator signal points that way.
+    pub const INDICATOR_LEFT: f32 = 51.0;
+    pub const INDICATOR_RIGHT: f32 = 52.0;
+}
+
+fn rear_lights(m: &mut Mesh, hw: f32, z: f32, y: f32) {
+    let brake = Material { color: [1.0, 0.03, 0.08], emissive: marker::BRAKE };
+    let amber = [1.0, 0.42, 0.04];
+    for side in [-1.0f32, 1.0] {
+        let (x0, x1) = (side * (hw - 0.42), side * (hw - 0.08));
+        m.cuboid([x0.min(x1), y, z - 0.03], [x0.max(x1), y + 0.13, z + 0.01], brake);
+        let code = if side < 0.0 { marker::INDICATOR_LEFT } else { marker::INDICATOR_RIGHT };
+        let ind = Material { color: amber, emissive: code };
+        let (i0, i1) = (side * (hw - 0.08), side * (hw + 0.02));
+        m.cuboid([i0.min(i1), y - 0.02, z - 0.03], [i0.max(i1), y + 0.15, z + 0.01], ind);
+    }
+}
+
+/// Traffic vehicle archetypes (dimensions match `sim::Archetype::half_extents`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VehicleKind {
+    Coupe,
+    Van,
+    Truck,
+    Sports,
+}
+
+const COUPE_STATIONS: [[f32; 6]; 8] = [
+    [0.00, 0.84, 0.32, 0.80, 0.82, 0.70],
+    [0.20, 0.92, 0.24, 0.92, 0.95, 0.80],
+    [0.85, 0.92, 0.22, 0.95, 1.00, 0.80],
+    [1.35, 0.92, 0.22, 0.95, 1.42, 0.72],
+    [2.70, 0.92, 0.22, 0.93, 1.45, 0.72],
+    [3.25, 0.92, 0.22, 0.90, 0.95, 0.80],
+    [4.05, 0.88, 0.24, 0.80, 0.82, 0.78],
+    [4.40, 0.80, 0.32, 0.62, 0.62, 0.70],
+];
+
+const SPORTS_STATIONS: [[f32; 6]; 8] = [
+    [0.00, 0.86, 0.30, 0.76, 0.78, 0.70],
+    [0.15, 0.95, 0.22, 0.88, 0.90, 0.80],
+    [1.00, 0.95, 0.20, 0.90, 0.94, 0.78],
+    [1.70, 0.95, 0.20, 0.88, 1.12, 0.60],
+    [2.40, 0.95, 0.20, 0.86, 1.15, 0.58],
+    [3.00, 0.93, 0.20, 0.80, 0.80, 0.72],
+    [4.00, 0.88, 0.22, 0.66, 0.68, 0.70],
+    [4.40, 0.78, 0.28, 0.48, 0.50, 0.60],
+];
+
+const VAN_STATIONS: [[f32; 6]; 6] = [
+    [0.00, 0.98, 0.30, 1.90, 2.02, 0.92],
+    [0.10, 1.02, 0.26, 1.95, 2.06, 0.96],
+    [3.60, 1.02, 0.26, 1.95, 2.06, 0.96],
+    [4.20, 1.00, 0.26, 1.40, 1.90, 0.92],
+    [4.75, 0.98, 0.28, 1.00, 1.05, 0.90],
+    [5.00, 0.92, 0.32, 0.85, 0.86, 0.86],
+];
+
+pub fn vehicle(kind: VehicleKind) -> Mesh {
+    let mut m = Mesh::default();
+    let tyre = Material { color: [0.012, 0.012, 0.02], emissive: 0.0 };
+    let glass = Material { color: [0.015, 0.02, 0.05], emissive: 0.12 };
+    match kind {
+        VehicleKind::Coupe | VehicleKind::Sports => {
+            let (st, body, neon) = if kind == VehicleKind::Coupe {
+                (&COUPE_STATIONS, [0.025, 0.07, 0.09], [0.9, 0.25, 1.0])
+            } else {
+                (&SPORTS_STATIONS, [0.11, 0.01, 0.045], [1.0, 0.75, 0.1])
+            };
+            let zc = 2.2;
+            let hw = st.iter().map(|s| s[1]).fold(0.0, f32::max);
+            shadow(&mut m, hw, zc);
+            hull(&mut m, st, zc, Material { color: body, emissive: 0.0 }, glass, 3..=3, &[2, 4]);
+            rear_lights(&mut m, hw * 0.9, -zc, 0.58);
+            let n = Material { color: neon, emissive: 2.2 };
+            for side in [-1.0f32, 1.0] {
+                let x = side * (hw + 0.004);
+                m.cuboid([x.min(x + side * 0.012), 0.46, 0.3 - zc], [x.max(x + side * 0.012), 0.49, 4.0 - zc], n);
+            }
+            for (wx, wz) in [(-hw + 0.06, 0.8), (hw - 0.06, 0.8), (-hw + 0.06, 3.5), (hw - 0.06, 3.5)] {
+                wheel(&mut m, [wx, 0.32, wz - zc], 0.32, 0.24, tyre, tyre);
+            }
+        }
+        VehicleKind::Van => {
+            let zc = 2.5;
+            shadow(&mut m, 1.02, zc);
+            hull(&mut m, &VAN_STATIONS, zc, Material { color: [0.07, 0.055, 0.11], emissive: 0.0 }, glass, 3..=3, &[3]);
+            rear_lights(&mut m, 0.98, -zc, 0.75);
+            let n = Material { color: [0.1, 0.9, 0.8], emissive: 1.8 };
+            m.cuboid([-0.75, 1.82, -zc - 0.03], [0.75, 1.86, -zc + 0.01], n);
+            for (wx, wz) in [(-0.97, 0.9), (0.97, 0.9), (-0.97, 4.0), (0.97, 4.0)] {
+                wheel(&mut m, [wx, 0.36, wz - zc], 0.36, 0.26, tyre, tyre);
+            }
+        }
+        VehicleKind::Truck => {
+            let zc = 4.6;
+            shadow(&mut m, 1.25, zc);
+            let trailer = Material { color: [0.035, 0.03, 0.06], emissive: 0.0 };
+            let cab = Material { color: [0.09, 0.02, 0.06], emissive: 0.0 };
+            m.cuboid([-1.25, 1.0, -zc], [1.25, 3.6, 7.0 - zc], trailer);
+            m.cuboid([-1.15, 0.6, 7.25 - zc], [1.15, 2.9, 9.2 - zc], cab);
+            m.cuboid([-1.0, 1.9, 9.2 - zc], [1.0, 2.7, 9.21 - zc], glass);
+            let n = Material { color: [1.0, 0.12, 0.6], emissive: 2.4 };
+            for side in [-1.0f32, 1.0] {
+                let x = side * 1.252;
+                m.cuboid([x.min(x + side * 0.01), 3.45, -zc + 0.1], [x.max(x + side * 0.01), 3.52, 6.9 - zc], n);
+            }
+            m.cuboid([-1.2, 3.45, -zc - 0.02], [1.2, 3.52, -zc - 0.005], n);
+            m.cuboid([-1.25, 0.55, -zc - 0.1], [1.25, 0.75, -zc + 0.2], Material { color: [0.05, 0.05, 0.06], emissive: 0.0 });
+            rear_lights(&mut m, 1.2, -zc - 0.1, 0.8);
+            for (wx, wz) in [(-1.12, 0.8), (1.12, 0.8), (-1.12, 2.1), (1.12, 2.1), (-1.08, 7.9), (1.08, 7.9)] {
+                wheel(&mut m, [wx, 0.5, wz - zc], 0.5, 0.3, tyre, tyre);
+            }
+        }
     }
     m
 }
@@ -312,6 +448,29 @@ mod tests {
             }
         }
         assert!(checked > 10);
+    }
+
+    #[test]
+    fn traffic_vehicles_match_sim_collision_boxes() {
+        // Must agree with sim::Archetype::half_extents (half width, half length).
+        for (kind, hw, hl) in [
+            (VehicleKind::Coupe, 0.92, 2.2),
+            (VehicleKind::Van, 1.02, 2.5),
+            (VehicleKind::Truck, 1.25, 4.6),
+            (VehicleKind::Sports, 0.95, 2.2),
+        ] {
+            let m = vehicle(kind);
+            check(&m);
+            let body = Mesh {
+                vertices: m.vertices.iter().copied().filter(|v| v.emissive >= 0.0 && v.emissive < 40.0).collect(),
+                indices: vec![],
+            };
+            let (lo, hi) = body.bounds();
+            assert!(((hi[0] - lo[0]) * 0.5 - hw).abs() < 0.15, "{kind:?} width {}", hi[0] - lo[0]);
+            assert!(((hi[2] - lo[2]) * 0.5 - hl).abs() < 0.2, "{kind:?} length {}", hi[2] - lo[2]);
+            assert!(m.vertices.iter().any(|v| v.emissive == marker::BRAKE));
+            assert!(m.vertices.iter().any(|v| v.emissive == marker::INDICATOR_LEFT));
+        }
     }
 
     #[test]

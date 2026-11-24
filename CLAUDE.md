@@ -11,7 +11,7 @@ Read these documents before making non-trivial changes:
 
 ## Current phase
 
-**M1 "First Drive" is complete and deployed** (https://sysfcuk.github.io/synthrace/); see `docs/reviews/M1.md`. It is waiting on the user to review handling feel and art direction. M2 "Speed and Feel" is next, but don't start it until the user says so. After each milestone, stop for review.
+**M2 "Speed and Feel" is complete and deployed** (https://sysfcuk.github.io/synthrace/); see `docs/reviews/M2.md`. It is waiting on the user to playtest feel, gamepad, touch and audio. M3 "Arcade Loop and Adaptive Music" is next, but don't start it until the user says so. After each milestone, stop for review.
 
 ## Lessons learned (keep this list current)
 
@@ -20,6 +20,9 @@ Read these documents before making non-trivial changes:
 - **The `trunk serve` watcher doesn't always pick up changes** under `crates/render/shaders/`. Rebuild with `trunk build --release` if in doubt.
 - **The golden simulation hash** (`sim::GOLDEN_HASH_SEED42_60S`) must match between native and wasm. Any intentional change to handling or tuning changes it: update the constant and say so in the commit.
 - **The world bend is purely visual.** Visual exaggeration (`VISUAL_CURVE_GAIN` and `VISUAL_HILL_GAIN` in `game::scene`) is safe only because every drawable goes through `bend()`. Never place anything by any other route.
+- **Traffic fairness is tested physically** (a free lateral gap of 2.5 m or more), not by lane occupancy. Cars mid-lane-change only half-block.
+- **Emissive marker codes** (`procgen::marker`, values of 50 and up) let the mesh shader light brake lights and indicators per instance. Ordinary emissive values must stay below 40.
+- **The desktop runner's `--warm N` runs the live simulation with the autopilot,** and `--stress` forces 40+ cars and about 5,000 particles for performance checks.
 - **A hidden browser pane throttles `requestAnimationFrame`.** In-browser frame times are meaningless unless the pane is visible.
 
 ## Non-negotiable constraints

@@ -79,6 +79,30 @@ impl Audio {
         }
     }
 
+    fn post(&self, msg: &js_sys::Object) {
+        if let Ok(port) = self.node.port() {
+            let _ = port.post_message(msg);
+        }
+    }
+
+    /// Sets consecutive parameters `id..id + values.len()` in one message.
+    pub fn set_params(&self, id: u32, values: &[f32]) {
+        let msg = js_sys::Object::new();
+        let _ = js_sys::Reflect::set(&msg, &"t".into(), &"pp".into());
+        let _ = js_sys::Reflect::set(&msg, &"id".into(), &id.into());
+        let _ = js_sys::Reflect::set(&msg, &"v".into(), &js_sys::Float32Array::from(values));
+        self.post(&msg);
+    }
+
+    /// Fires a one-shot effect (see `dsp::sfx::shot`).
+    pub fn trigger(&self, kind: u32, value: f32) {
+        let msg = js_sys::Object::new();
+        let _ = js_sys::Reflect::set(&msg, &"t".into(), &"e".into());
+        let _ = js_sys::Reflect::set(&msg, &"k".into(), &kind.into());
+        let _ = js_sys::Reflect::set(&msg, &"v".into(), &value.into());
+        self.post(&msg);
+    }
+
     /// Beat phase extrapolated from the worklet's last report to "now" on the audio clock.
     pub fn beat_phase(&self) -> f32 {
         let (phase, at) = self.beat.get();

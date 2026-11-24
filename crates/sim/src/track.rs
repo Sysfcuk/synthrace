@@ -93,6 +93,8 @@ impl Track {
 
         let mut track = Self { segs, palms: Vec::new() };
         track.palms = track.place_palms(&mut Pcg32::new(seed, 0xa1a1));
+        // Sorted by distance so collision checks can binary-search a window.
+        track.palms.sort_by(|a, b| a.s.total_cmp(&b.s));
         track
     }
 
@@ -131,6 +133,18 @@ impl Track {
 
     pub fn length(&self) -> f32 {
         self.segs.len() as f32 * SEGMENT_LEN
+    }
+
+    /// Signed shortest distance from `b` to `a` along the ring, in (−len/2, len/2].
+    pub fn delta(&self, a: f32, b: f32) -> f32 {
+        let len = self.length();
+        let mut d = (a - b) % len;
+        if d > len * 0.5 {
+            d -= len;
+        } else if d <= -len * 0.5 {
+            d += len;
+        }
+        d
     }
 
     pub fn wrap(&self, s: f32) -> f32 {

@@ -1,27 +1,32 @@
-//! SYNTHRACE renderer: Neon Bent-World ground, sky and instanced meshes into an HDR
-//! target, COD:AW-style bloom chain, AgX composite. Designed strictly to the
+//! SYNTHRACE renderer: Neon Bent-World ground, sky, instanced meshes and additive particles
+//! into an HDR target, COD:AW-style bloom chain, AgX composite. Designed strictly to the
 //! WebGL2 downlevel limits so the same code runs on WebGPU and WebGL2.
 
+mod gpu;
+mod post;
 pub mod shaders;
 
 use glam::{Mat4, Vec3};
+use gpu::{ADDITIVE, GpuMesh, PipelineDesc, depth_state, pipeline, sampler_entry, shader, tex_entry, ubo_entry, upload_mesh};
+use post::{BLOOM_LEVELS, Layouts, SizedResources};
 use wgpu::util::DeviceExt;
 
 pub const PROFILE_SAMPLES: usize = 64;
 pub const PROFILE_STEP: f32 = 20.0;
-const BLOOM_LEVELS: usize = 6;
-const GROUND_COLS: u32 = 161;
-const GROUND_ROWS: u32 = 253;
-const GROUND_CELL_Z: f32 = 5.0;
-const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth24Plus;
 /// Maximum palm instances drawn per frame.
 pub const MAX_PALMS: usize = 255;
+/// Maximum traffic instances per vehicle kind.
+pub const MAX_TRAFFIC_PER_KIND: usize = 48;
+pub const MAX_PARTICLES: usize = 6000;
+const TRAFFIC_KINDS: usize = 4;
+const MAX_INSTANCES: usize = 1 + MAX_PALMS + TRAFFIC_KINDS * MAX_TRAFFIC_PER_KIND;
 
 /// One mesh instance in camera-relative track space (x lateral, y up, z ahead of the camera).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct Instance {
     pub pos_yaw: [f32; 4],
+    /// scale, roll, brake light 0..1, indicator signal (−1 left, +1 right, 0 off).
     pub scale_roll: [f32; 4],
 }
 
@@ -29,6 +34,22 @@ impl Instance {
     pub fn new(x: f32, y: f32, z: f32, yaw: f32, scale: f32, roll: f32) -> Self {
         Self { pos_yaw: [x, y, z, yaw], scale_roll: [scale, roll, 0.0, 0.0] }
     }
+
+    pub fn with_lights(mut self, brake: f32, indicator: f32) -> Self {
+        self.scale_roll[2] = brake;
+        self.scale_roll[3] = indicator;
+        self
+    }
+}
+
+/// Additive HDR particle in camera-relative track space.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct Particle {
+    /// x, y, z, half-size (m).
+    pub pos_size: [f32; 4],
+    /// Linear HDR colour (premultiplied by intensity), w = streak length along z (0 = round sprite).
+    pub color: [f32; 4],
 }
 
 /// Chase camera, in camera-relative track space (the camera always sits at z = 0).
@@ -39,6 +60,17 @@ pub struct Camera {
     /// Pitch (rad); negative looks down.
     pub pitch: f32,
     pub fov_deg: f32,
+}
+
+/// Screen-space feedback driven by gameplay.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Fx {
+    /// Camera offset (m) from shake.
+    pub shake: [f32; 2],
+    /// Nitro intensity 0..1 (stronger blur and chromatic aberration).
+    pub nitro: f32,
+    /// Full-screen flash: linear colour × intensity.
+    pub flash: [f32; 4],
 }
 
 /// Everything the renderer needs for one frame (built by the game from a sim snapshot).
@@ -52,29 +84,13 @@ pub struct FrameParams<'a> {
     /// Musical beat phase 0..1 (0 = on the beat).
     pub beat_phase: f32,
     pub camera: Camera,
+    pub fx: Fx,
     pub profile: [[f32; 2]; PROFILE_SAMPLES],
     pub car: Instance,
     pub palms: &'a [Instance],
-}
-
-struct GpuMesh {
-    vb: wgpu::Buffer,
-    ib: wgpu::Buffer,
-    count: u32,
-}
-
-fn upload_mesh(device: &wgpu::Device, label: &str, m: &procgen::Mesh) -> GpuMesh {
-    let vb = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some(label),
-        contents: bytemuck::cast_slice(&m.vertices),
-        usage: wgpu::BufferUsages::VERTEX,
-    });
-    let ib = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some(label),
-        contents: bytemuck::cast_slice(&m.indices),
-        usage: wgpu::BufferUsages::INDEX,
-    });
-    GpuMesh { vb, ib, count: m.indices.len() as u32 }
+    /// Per vehicle kind: coupe, van, truck, sports.
+    pub traffic: [&'a [Instance]; TRAFFIC_KINDS],
+    pub particles: &'a [Particle],
 }
 
 #[repr(C)]
@@ -93,6 +109,7 @@ struct FrameUniform {
 struct PostUniform {
     a: [f32; 4],
     b: [f32; 4],
+    flash: [f32; 4],
 }
 
 /// Per-frame counters for the debug overlay.
@@ -100,25 +117,14 @@ struct PostUniform {
 pub struct RenderStats {
     pub draw_calls: u32,
     pub passes: u32,
+    pub instances: u32,
+    pub particles: u32,
 }
 
-struct Target {
-    _tex: wgpu::Texture,
-    view: wgpu::TextureView,
-    width: u32,
-    height: u32,
-}
-
-struct SizedResources {
-    hdr: Target,
-    depth: Target,
-    down: Vec<Target>,
-    up: Vec<Target>,
-    down_bgs: Vec<wgpu::BindGroup>,
-    up_bgs: Vec<wgpu::BindGroup>,
-    composite_bg: wgpu::BindGroup,
-    _param_bufs: Vec<wgpu::Buffer>,
-}
+/// Mesh slots in the order instances are packed into the instance buffer.
+const SLOT_CAR: usize = 0;
+const SLOT_PALM: usize = 1;
+const SLOT_TRAFFIC: usize = 2;
 
 pub struct Renderer {
     device: wgpu::Device,
@@ -130,148 +136,41 @@ pub struct Renderer {
     post_ubo: wgpu::Buffer,
     frame_bg: wgpu::BindGroup,
     sampler: wgpu::Sampler,
-    sky_pipe: wgpu::RenderPipeline,
-    ground_pipe: wgpu::RenderPipeline,
-    down_pipe: wgpu::RenderPipeline,
-    up_pipe: wgpu::RenderPipeline,
-    composite_pipe: wgpu::RenderPipeline,
     down_bgl: wgpu::BindGroupLayout,
     up_bgl: wgpu::BindGroupLayout,
     composite_bgl: wgpu::BindGroupLayout,
-    ground_vb: wgpu::Buffer,
-    ground_ib: wgpu::Buffer,
+    sky_pipe: wgpu::RenderPipeline,
+    ground_pipe: wgpu::RenderPipeline,
     mesh_pipe: wgpu::RenderPipeline,
-    car_mesh: GpuMesh,
-    palm_mesh: GpuMesh,
+    particle_pipe: wgpu::RenderPipeline,
+    down_pipe: wgpu::RenderPipeline,
+    up_pipe: wgpu::RenderPipeline,
+    composite_pipe: wgpu::RenderPipeline,
+    ground: GpuMesh,
+    /// car, palm, coupe, van, truck, sports
+    meshes: Vec<GpuMesh>,
     instance_buf: wgpu::Buffer,
-    palm_count: u32,
-    ground_index_count: u32,
+    particle_buf: wgpu::Buffer,
+    /// (first instance, count) per mesh slot for the current frame.
+    batches: Vec<(u32, u32)>,
+    particle_count: u32,
     sized: SizedResources,
     pub stats: RenderStats,
 }
 
-/// Picks the HDR scene format: RGBA16F when renderable + filterable (EXT_color_buffer_float on WebGL2),
-/// otherwise an LDR fallback so the game still runs.
+/// Picks the HDR scene format: RGBA16F when renderable, blendable and filterable
+/// (EXT_color_buffer_float on WebGL2), otherwise an LDR fallback so the game still runs.
 pub fn choose_hdr_format(adapter: &wgpu::Adapter) -> wgpu::TextureFormat {
     let f = wgpu::TextureFormat::Rgba16Float;
     let feats = adapter.get_texture_format_features(f);
     let need = wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING;
-    if feats.allowed_usages.contains(need) && feats.flags.contains(wgpu::TextureFormatFeatureFlags::FILTERABLE) {
+    let flags = wgpu::TextureFormatFeatureFlags::FILTERABLE | wgpu::TextureFormatFeatureFlags::BLENDABLE;
+    if feats.allowed_usages.contains(need) && feats.flags.contains(flags) {
         f
     } else {
-        log::warn!("RGBA16F not renderable; falling back to RGBA8 (no HDR)");
+        log::warn!("RGBA16F not renderable/blendable; falling back to RGBA8 (no HDR)");
         wgpu::TextureFormat::Rgba8Unorm
     }
-}
-
-fn shader(device: &wgpu::Device, name: &str) -> wgpu::ShaderModule {
-    device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some(name),
-        source: wgpu::ShaderSource::Wgsl(shaders::compose(name).into()),
-    })
-}
-
-fn tex_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
-    wgpu::BindGroupLayoutEntry {
-        binding,
-        visibility: wgpu::ShaderStages::FRAGMENT,
-        ty: wgpu::BindingType::Texture {
-            sample_type: wgpu::TextureSampleType::Float { filterable: true },
-            view_dimension: wgpu::TextureViewDimension::D2,
-            multisampled: false,
-        },
-        count: None,
-    }
-}
-
-fn sampler_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
-    wgpu::BindGroupLayoutEntry {
-        binding,
-        visibility: wgpu::ShaderStages::FRAGMENT,
-        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-        count: None,
-    }
-}
-
-fn ubo_entry(binding: u32, visibility: wgpu::ShaderStages) -> wgpu::BindGroupLayoutEntry {
-    wgpu::BindGroupLayoutEntry {
-        binding,
-        visibility,
-        ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
-        count: None,
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn pipeline(
-    device: &wgpu::Device,
-    label: &str,
-    module: &wgpu::ShaderModule,
-    vs: &str,
-    fs: &str,
-    layouts: &[Option<&wgpu::BindGroupLayout>],
-    buffers: &[Option<wgpu::VertexBufferLayout>],
-    format: wgpu::TextureFormat,
-    depth: Option<wgpu::DepthStencilState>,
-) -> wgpu::RenderPipeline {
-    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: Some(label),
-        bind_group_layouts: layouts,
-        immediate_size: 0,
-    });
-    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label: Some(label),
-        layout: Some(&layout),
-        vertex: wgpu::VertexState { module, entry_point: Some(vs), compilation_options: Default::default(), buffers },
-        primitive: wgpu::PrimitiveState { cull_mode: None, ..Default::default() },
-        depth_stencil: depth,
-        multisample: wgpu::MultisampleState::default(),
-        fragment: Some(wgpu::FragmentState {
-            module,
-            entry_point: Some(fs),
-            compilation_options: Default::default(),
-            targets: &[Some(wgpu::ColorTargetState { format, blend: None, write_mask: wgpu::ColorWrites::ALL })],
-        }),
-        multiview_mask: None,
-        cache: None,
-    })
-}
-
-fn make_target(device: &wgpu::Device, label: &str, w: u32, h: u32, format: wgpu::TextureFormat) -> Target {
-    let tex = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some(label),
-        size: wgpu::Extent3d { width: w.max(1), height: h.max(1), depth_or_array_layers: 1 },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
-        view_formats: &[],
-    });
-    let view = tex.create_view(&Default::default());
-    Target { _tex: tex, view, width: w.max(1), height: h.max(1) }
-}
-
-/// Ground lattice: lateral columns spread non-linearly (dense near the road, wide at the edges),
-/// rows every 5 m out to ~1.26 km.
-fn ground_mesh() -> (Vec<[f32; 2]>, Vec<u32>) {
-    let mut v = Vec::with_capacity((GROUND_COLS * GROUND_ROWS) as usize);
-    for r in 0..GROUND_ROWS {
-        let z = r as f32 * GROUND_CELL_Z;
-        for c in 0..GROUND_COLS {
-            let u = c as f32 / (GROUND_COLS - 1) as f32 * 2.0 - 1.0;
-            let x = 40.0 * u + 1460.0 * u * u * u;
-            v.push([x, z]);
-        }
-    }
-    let mut idx = Vec::with_capacity(((GROUND_COLS - 1) * (GROUND_ROWS - 1) * 6) as usize);
-    for r in 0..GROUND_ROWS - 1 {
-        for c in 0..GROUND_COLS - 1 {
-            let i = r * GROUND_COLS + c;
-            idx.extend_from_slice(&[i, i + GROUND_COLS, i + 1, i + 1, i + GROUND_COLS, i + GROUND_COLS + 1]);
-        }
-    }
-    (v, idx)
 }
 
 impl Renderer {
@@ -284,40 +183,30 @@ impl Renderer {
         height: u32,
     ) -> Self {
         let manual_srgb = !output_format.is_srgb();
-
-        let frame_ubo = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("frame ubo"),
-            size: std::mem::size_of::<FrameUniform>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let post_ubo = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("post ubo"),
-            size: std::mem::size_of::<PostUniform>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let frame_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("frame bgl"),
-            entries: &[ubo_entry(0, wgpu::ShaderStages::VERTEX_FRAGMENT)],
-        });
+        let ubo = |label: &str, size: usize| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size: size as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+        };
+        let frame_ubo = ubo("frame ubo", std::mem::size_of::<FrameUniform>());
+        let post_ubo = ubo("post ubo", std::mem::size_of::<PostUniform>());
+        let bgl = |label: &str, entries: &[wgpu::BindGroupLayoutEntry]| {
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some(label), entries })
+        };
+        let frame_bgl = bgl("frame bgl", &[ubo_entry(0, wgpu::ShaderStages::VERTEX_FRAGMENT)]);
         let frame_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("frame bg"),
             layout: &frame_bgl,
             entries: &[wgpu::BindGroupEntry { binding: 0, resource: frame_ubo.as_entire_binding() }],
         });
-        let down_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("bloom down bgl"),
-            entries: &[tex_entry(0), sampler_entry(1), ubo_entry(2, wgpu::ShaderStages::FRAGMENT)],
-        });
-        let up_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("bloom up bgl"),
-            entries: &[tex_entry(0), tex_entry(1), sampler_entry(2), ubo_entry(3, wgpu::ShaderStages::FRAGMENT)],
-        });
-        let composite_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("composite bgl"),
-            entries: &[tex_entry(0), tex_entry(1), sampler_entry(2), ubo_entry(3, wgpu::ShaderStages::FRAGMENT)],
-        });
+        let down_bgl = bgl("bloom down bgl", &[tex_entry(0), sampler_entry(1), ubo_entry(2, wgpu::ShaderStages::FRAGMENT)]);
+        let up_bgl =
+            bgl("bloom up bgl", &[tex_entry(0), tex_entry(1), sampler_entry(2), ubo_entry(3, wgpu::ShaderStages::FRAGMENT)]);
+        let composite_bgl =
+            bgl("composite bgl", &[tex_entry(0), tex_entry(1), sampler_entry(2), ubo_entry(3, wgpu::ShaderStages::FRAGMENT)]);
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("linear clamp"),
             mag_filter: wgpu::FilterMode::Linear,
@@ -325,51 +214,46 @@ impl Renderer {
             ..Default::default()
         });
 
-        let depth_test = |write: bool, compare| wgpu::DepthStencilState {
-            format: DEPTH_FORMAT,
-            depth_write_enabled: Some(write),
-            depth_compare: Some(compare),
-            stencil: Default::default(),
-            bias: Default::default(),
-        };
-
         let sky_mod = shader(&device, "sky.wgsl");
         let ground_mod = shader(&device, "ground.wgsl");
+        let mesh_mod = shader(&device, "mesh.wgsl");
+        let particle_mod = shader(&device, "particles.wgsl");
         let down_mod = shader(&device, "bloom_down.wgsl");
         let up_mod = shader(&device, "bloom_up.wgsl");
         let comp_mod = shader(&device, "composite.wgsl");
+        let frame_only = [Some(&frame_bgl)];
 
+        let base = |label, module, vs, fs| PipelineDesc {
+            label,
+            module,
+            vs,
+            fs,
+            layouts: &frame_only,
+            buffers: &[],
+            format: hdr_format,
+            depth: None,
+            blend: None,
+        };
         let sky_pipe = pipeline(
             &device,
-            "sky",
-            &sky_mod,
-            "vs_fullscreen",
-            "fs_sky",
-            &[Some(&frame_bgl)],
-            &[],
-            hdr_format,
-            Some(depth_test(false, wgpu::CompareFunction::Always)),
+            PipelineDesc {
+                depth: Some(depth_state(false, wgpu::CompareFunction::Always)),
+                ..base("sky", &sky_mod, "vs_fullscreen", "fs_sky")
+            },
         );
         let ground_layout = wgpu::VertexBufferLayout {
             array_stride: 8,
             step_mode: wgpu::VertexStepMode::Vertex,
-            attributes: &[wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x2, offset: 0, shader_location: 0 }],
+            attributes: &wgpu::vertex_attr_array![0 => Float32x2],
         };
         let ground_pipe = pipeline(
             &device,
-            "ground",
-            &ground_mod,
-            "vs_ground",
-            "fs_ground",
-            &[Some(&frame_bgl)],
-            &[Some(ground_layout)],
-            hdr_format,
-            Some(depth_test(true, wgpu::CompareFunction::Less)),
+            PipelineDesc {
+                buffers: &[Some(ground_layout)],
+                depth: Some(depth_state(true, wgpu::CompareFunction::Less)),
+                ..base("ground", &ground_mod, "vs_ground", "fs_ground")
+            },
         );
-        let down_pipe =
-            pipeline(&device, "bloom down", &down_mod, "vs_fullscreen", "fs_down", &[Some(&down_bgl)], &[], hdr_format, None);
-        let up_pipe = pipeline(&device, "bloom up", &up_mod, "vs_fullscreen", "fs_up", &[Some(&up_bgl)], &[], hdr_format, None);
-        let mesh_mod = shader(&device, "mesh.wgsl");
         let mesh_layout = wgpu::VertexBufferLayout {
             array_stride: std::mem::size_of::<procgen::Vertex>() as u64,
             step_mode: wgpu::VertexStepMode::Vertex,
@@ -382,51 +266,86 @@ impl Renderer {
         };
         let mesh_pipe = pipeline(
             &device,
-            "mesh",
-            &mesh_mod,
-            "vs_mesh",
-            "fs_mesh",
-            &[Some(&frame_bgl)],
-            &[Some(mesh_layout), Some(instance_layout)],
-            hdr_format,
-            Some(depth_test(true, wgpu::CompareFunction::Less)),
+            PipelineDesc {
+                buffers: &[Some(mesh_layout), Some(instance_layout)],
+                depth: Some(depth_state(true, wgpu::CompareFunction::Less)),
+                ..base("mesh", &mesh_mod, "vs_mesh", "fs_mesh")
+            },
         );
-        let car_mesh = upload_mesh(&device, "car", &procgen::car(&procgen::CAR_DEFAULT));
-        let palm_mesh = upload_mesh(&device, "palm", &procgen::palm());
+        let particle_layout = wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<Particle>() as u64,
+            step_mode: wgpu::VertexStepMode::Instance,
+            attributes: &wgpu::vertex_attr_array![0 => Float32x4, 1 => Float32x4],
+        };
+        let particle_pipe = pipeline(
+            &device,
+            PipelineDesc {
+                buffers: &[Some(particle_layout)],
+                depth: Some(depth_state(false, wgpu::CompareFunction::Less)),
+                blend: Some(ADDITIVE),
+                ..base("particles", &particle_mod, "vs_particle", "fs_particle")
+            },
+        );
+        let down_layouts = [Some(&down_bgl)];
+        let up_layouts = [Some(&up_bgl)];
+        let comp_layouts = [Some(&frame_bgl), Some(&composite_bgl)];
+        let down_pipe = pipeline(
+            &device,
+            PipelineDesc { layouts: &down_layouts, ..base("bloom down", &down_mod, "vs_fullscreen", "fs_down") },
+        );
+        let up_pipe =
+            pipeline(&device, PipelineDesc { layouts: &up_layouts, ..base("bloom up", &up_mod, "vs_fullscreen", "fs_up") });
+        let composite_pipe = pipeline(
+            &device,
+            PipelineDesc {
+                layouts: &comp_layouts,
+                format: output_format,
+                ..base("composite", &comp_mod, "vs_fullscreen", "fs_composite")
+            },
+        );
+
+        let (gv, gi) = gpu::ground_mesh();
+        let ground = GpuMesh {
+            vb: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("ground vb"),
+                contents: bytemuck::cast_slice(&gv),
+                usage: wgpu::BufferUsages::VERTEX,
+            }),
+            ib: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("ground ib"),
+                contents: bytemuck::cast_slice(&gi),
+                usage: wgpu::BufferUsages::INDEX,
+            }),
+            count: gi.len() as u32,
+        };
+        use procgen::VehicleKind as V;
+        let meshes = vec![
+            upload_mesh(&device, "car", &procgen::car(&procgen::CAR_DEFAULT)),
+            upload_mesh(&device, "palm", &procgen::palm()),
+            upload_mesh(&device, "coupe", &procgen::vehicle(V::Coupe)),
+            upload_mesh(&device, "van", &procgen::vehicle(V::Van)),
+            upload_mesh(&device, "truck", &procgen::vehicle(V::Truck)),
+            upload_mesh(&device, "sports", &procgen::vehicle(V::Sports)),
+        ];
         let instance_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("instances"),
-            size: ((MAX_PALMS + 1) * std::mem::size_of::<Instance>()) as u64,
+            size: (MAX_INSTANCES * std::mem::size_of::<Instance>()) as u64,
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-
-        let composite_pipe = pipeline(
+        let particle_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("particles"),
+            size: (MAX_PARTICLES * std::mem::size_of::<Particle>()) as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let sized = SizedResources::new(
             &device,
-            "composite",
-            &comp_mod,
-            "vs_fullscreen",
-            "fs_composite",
-            &[Some(&frame_bgl), Some(&composite_bgl)],
-            &[],
-            output_format,
-            None,
+            hdr_format,
+            &Layouts { down: &down_bgl, up: &up_bgl, composite: &composite_bgl, sampler: &sampler, post_ubo: &post_ubo },
+            width,
+            height,
         );
-
-        let (verts, idx) = ground_mesh();
-        let ground_vb = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("ground vb"),
-            contents: bytemuck::cast_slice(&verts),
-            usage: wgpu::BufferUsages::VERTEX,
-        });
-        let ground_ib = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("ground ib"),
-            contents: bytemuck::cast_slice(&idx),
-            usage: wgpu::BufferUsages::INDEX,
-        });
-
-        let sized =
-            Self::create_sized(&device, hdr_format, &down_bgl, &up_bgl, &composite_bgl, &sampler, &post_ubo, width, height);
-
         Self {
             device,
             queue,
@@ -437,22 +356,22 @@ impl Renderer {
             post_ubo,
             frame_bg,
             sampler,
-            sky_pipe,
-            ground_pipe,
-            down_pipe,
-            up_pipe,
-            composite_pipe,
             down_bgl,
             up_bgl,
             composite_bgl,
-            ground_vb,
-            ground_ib,
-            ground_index_count: idx.len() as u32,
+            sky_pipe,
+            ground_pipe,
             mesh_pipe,
-            car_mesh,
-            palm_mesh,
+            particle_pipe,
+            down_pipe,
+            up_pipe,
+            composite_pipe,
+            ground,
+            meshes,
             instance_buf,
-            palm_count: 0,
+            particle_buf,
+            batches: vec![(0, 0); 2 + TRAFFIC_KINDS],
+            particle_count: 0,
             sized,
             stats: RenderStats::default(),
         }
@@ -470,115 +389,25 @@ impl Renderer {
         (self.sized.hdr.width, self.sized.hdr.height)
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn create_sized(
-        device: &wgpu::Device,
-        hdr_format: wgpu::TextureFormat,
-        down_bgl: &wgpu::BindGroupLayout,
-        up_bgl: &wgpu::BindGroupLayout,
-        composite_bgl: &wgpu::BindGroupLayout,
-        sampler: &wgpu::Sampler,
-        post_ubo: &wgpu::Buffer,
-        width: u32,
-        height: u32,
-    ) -> SizedResources {
-        let hdr = make_target(device, "hdr", width, height, hdr_format);
-        let depth = make_target(device, "depth", width, height, DEPTH_FORMAT);
-        let mut down = Vec::new();
-        let mut up = Vec::new();
-        let (mut w, mut h) = (width, height);
-        for i in 0..BLOOM_LEVELS {
-            w = (w / 2).max(1);
-            h = (h / 2).max(1);
-            down.push(make_target(device, &format!("bloom down {i}"), w, h, hdr_format));
-            up.push(make_target(device, &format!("bloom up {i}"), w, h, hdr_format));
-        }
-        let mut param_bufs = Vec::new();
-        let mut ubo = |v: [f32; 4]| {
-            let b = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("bloom params"),
-                contents: bytemuck::cast_slice(&v),
-                usage: wgpu::BufferUsages::UNIFORM,
-            });
-            param_bufs.push(b);
-            param_bufs.len() - 1
-        };
-        let mut down_param_idx = Vec::new();
-        for i in 0..BLOOM_LEVELS {
-            let src = if i == 0 { &hdr } else { &down[i - 1] };
-            down_param_idx.push(ubo([1.0 / src.width as f32, 1.0 / src.height as f32, if i == 0 { 1.0 } else { 0.0 }, 0.0]));
-        }
-        let mut up_param_idx = Vec::new();
-        for i in 0..BLOOM_LEVELS - 1 {
-            let lower = &up[i + 1];
-            up_param_idx.push(ubo([1.0 / lower.width as f32, 1.0 / lower.height as f32, 1.0, 0.0]));
-        }
-        let down_bgs = (0..BLOOM_LEVELS)
-            .map(|i| {
-                let src = if i == 0 { &hdr } else { &down[i - 1] };
-                device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("bloom down bg"),
-                    layout: down_bgl,
-                    entries: &[
-                        wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&src.view) },
-                        wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(sampler) },
-                        wgpu::BindGroupEntry { binding: 2, resource: param_bufs[down_param_idx[i]].as_entire_binding() },
-                    ],
-                })
-            })
-            .collect();
-        // up[N-1] is produced by a pass reading down[N-1] twice-equivalent: we simply treat
-        // the smallest level's "lower" as itself with zero contribution by using down[N-1] as both.
-        let up_bgs = (0..BLOOM_LEVELS - 1)
-            .map(|i| {
-                let lower = if i + 1 == BLOOM_LEVELS - 1 { &down[i + 1] } else { &up[i + 1] };
-                device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("bloom up bg"),
-                    layout: up_bgl,
-                    entries: &[
-                        wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&lower.view) },
-                        wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&down[i].view) },
-                        wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(sampler) },
-                        wgpu::BindGroupEntry { binding: 3, resource: param_bufs[up_param_idx[i]].as_entire_binding() },
-                    ],
-                })
-            })
-            .collect();
-        let composite_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("composite bg"),
-            layout: composite_bgl,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&hdr.view) },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&up[0].view) },
-                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(sampler) },
-                wgpu::BindGroupEntry { binding: 3, resource: post_ubo.as_entire_binding() },
-            ],
-        });
-        SizedResources { hdr, depth, down, up, down_bgs, up_bgs, composite_bg, _param_bufs: param_bufs }
-    }
-
     pub fn resize(&mut self, width: u32, height: u32) {
         if (width.max(1), height.max(1)) == self.size() {
             return;
         }
-        self.sized = Self::create_sized(
-            &self.device,
-            self.hdr_format,
-            &self.down_bgl,
-            &self.up_bgl,
-            &self.composite_bgl,
-            &self.sampler,
-            &self.post_ubo,
-            width,
-            height,
-        );
+        let l = Layouts {
+            down: &self.down_bgl,
+            up: &self.up_bgl,
+            composite: &self.composite_bgl,
+            sampler: &self.sampler,
+            post_ubo: &self.post_ubo,
+        };
+        self.sized = SizedResources::new(&self.device, self.hdr_format, &l, width, height);
     }
 
     fn upload(&mut self, p: &FrameParams) {
         let (w, h) = self.size();
         let aspect = w as f32 / h as f32;
         let fov = p.camera.fov_deg.to_radians();
-        let eye = Vec3::new(p.camera.x, p.camera.height, 0.0);
+        let eye = Vec3::new(p.camera.x + p.fx.shake[0], p.camera.height + p.fx.shake[1], 0.0);
         let dir = Vec3::new(0.0, p.camera.pitch.sin(), p.camera.pitch.cos());
         let view = Mat4::look_to_lh(eye, dir, Vec3::Y);
         let proj = Mat4::perspective_lh(fov, aspect, 0.3, 2000.0);
@@ -596,30 +425,43 @@ impl Renderer {
             profile,
         };
         self.queue.write_buffer(&self.frame_ubo, 0, bytemuck::bytes_of(&fu));
+        let s2 = p.speed01 * p.speed01;
         let pu = PostUniform {
-            a: [0.05, 0.95, 1.0 / BLOOM_LEVELS as f32, if self.manual_srgb { 1.0 } else { 0.0 }],
-            b: [0.55, 0.035, 0.004 * p.speed01, 0.035 * p.speed01 * p.speed01],
+            a: [0.05 + 0.02 * p.fx.nitro, 0.95, 1.0 / BLOOM_LEVELS as f32, if self.manual_srgb { 1.0 } else { 0.0 }],
+            b: [0.55, 0.035, 0.004 * p.speed01 + 0.008 * p.fx.nitro, 0.035 * s2 + 0.05 * p.fx.nitro],
+            flash: p.fx.flash,
         };
         self.queue.write_buffer(&self.post_ubo, 0, bytemuck::bytes_of(&pu));
-        let n = p.palms.len().min(MAX_PALMS);
-        self.queue.write_buffer(&self.instance_buf, 0, bytemuck::bytes_of(&p.car));
-        if n > 0 {
-            self.queue.write_buffer(
-                &self.instance_buf,
-                std::mem::size_of::<Instance>() as u64,
-                bytemuck::cast_slice(&p.palms[..n]),
-            );
+
+        // Pack all instances into one buffer: car, palms, then each traffic kind.
+        let mut packed: Vec<Instance> = Vec::with_capacity(MAX_INSTANCES);
+        let push = |slot: usize, items: &[Instance], cap: usize, batches: &mut Vec<(u32, u32)>, packed: &mut Vec<Instance>| {
+            let n = items.len().min(cap);
+            batches[slot] = (packed.len() as u32, n as u32);
+            packed.extend_from_slice(&items[..n]);
+        };
+        push(SLOT_CAR, std::slice::from_ref(&p.car), 1, &mut self.batches, &mut packed);
+        push(SLOT_PALM, p.palms, MAX_PALMS, &mut self.batches, &mut packed);
+        for (k, items) in p.traffic.iter().enumerate() {
+            push(SLOT_TRAFFIC + k, items, MAX_TRAFFIC_PER_KIND, &mut self.batches, &mut packed);
         }
-        self.palm_count = n as u32;
+        self.queue.write_buffer(&self.instance_buf, 0, bytemuck::cast_slice(&packed));
+        let np = p.particles.len().min(MAX_PARTICLES);
+        if np > 0 {
+            self.queue.write_buffer(&self.particle_buf, 0, bytemuck::cast_slice(&p.particles[..np]));
+        }
+        self.particle_count = np as u32;
+        self.stats.instances = packed.len() as u32;
+        self.stats.particles = np as u32;
     }
 
     /// Renders one frame into `output` (a surface texture view or an offscreen target).
     pub fn render(&mut self, output: &wgpu::TextureView, p: &FrameParams) {
         self.upload(p);
-        let mut stats = RenderStats::default();
+        let mut draws = 0u32;
+        let mut passes = 0u32;
         let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("frame") });
         let s = &self.sized;
-
         {
             let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("scene"),
@@ -642,22 +484,30 @@ impl Renderer {
             pass.set_pipeline(&self.sky_pipe);
             pass.draw(0..3, 0..1);
             pass.set_pipeline(&self.ground_pipe);
-            pass.set_vertex_buffer(0, self.ground_vb.slice(..));
-            pass.set_index_buffer(self.ground_ib.slice(..), wgpu::IndexFormat::Uint32);
-            pass.draw_indexed(0..self.ground_index_count, 0, 0..1);
+            pass.set_vertex_buffer(0, self.ground.vb.slice(..));
+            pass.set_index_buffer(self.ground.ib.slice(..), wgpu::IndexFormat::Uint32);
+            pass.draw_indexed(0..self.ground.count, 0, 0..1);
+            draws += 2;
+
             pass.set_pipeline(&self.mesh_pipe);
             pass.set_vertex_buffer(1, self.instance_buf.slice(..));
-            pass.set_vertex_buffer(0, self.car_mesh.vb.slice(..));
-            pass.set_index_buffer(self.car_mesh.ib.slice(..), wgpu::IndexFormat::Uint32);
-            pass.draw_indexed(0..self.car_mesh.count, 0, 0..1);
-            stats.draw_calls += 3;
-            if self.palm_count > 0 {
-                pass.set_vertex_buffer(0, self.palm_mesh.vb.slice(..));
-                pass.set_index_buffer(self.palm_mesh.ib.slice(..), wgpu::IndexFormat::Uint32);
-                pass.draw_indexed(0..self.palm_mesh.count, 0, 1..1 + self.palm_count);
-                stats.draw_calls += 1;
+            for (mesh, &(first, count)) in self.meshes.iter().zip(self.batches.iter()) {
+                if count == 0 {
+                    continue;
+                }
+                pass.set_vertex_buffer(0, mesh.vb.slice(..));
+                pass.set_index_buffer(mesh.ib.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..mesh.count, 0, first..first + count);
+                draws += 1;
             }
-            stats.passes += 1;
+
+            if self.particle_count > 0 {
+                pass.set_pipeline(&self.particle_pipe);
+                pass.set_vertex_buffer(0, self.particle_buf.slice(..));
+                pass.draw(0..6, 0..self.particle_count);
+                draws += 1;
+            }
+            passes += 1;
         }
 
         let mut fullscreen = |enc: &mut wgpu::CommandEncoder,
@@ -683,21 +533,21 @@ impl Renderer {
                 pass.set_bind_group(i as u32, *g, &[]);
             }
             pass.draw(0..3, 0..1);
-            stats.draw_calls += 1;
-            stats.passes += 1;
+            draws += 1;
+            passes += 1;
         };
 
         for i in 0..BLOOM_LEVELS {
             fullscreen(&mut enc, "bloom down", &s.down[i].view, &self.down_pipe, &[&s.down_bgs[i]]);
         }
-        // Smallest level: up[N-1] is not rendered; up[N-2] reads down[N-1] directly (see create_sized).
         for i in (0..BLOOM_LEVELS - 1).rev() {
             fullscreen(&mut enc, "bloom up", &s.up[i].view, &self.up_pipe, &[&s.up_bgs[i]]);
         }
         fullscreen(&mut enc, "composite", output, &self.composite_pipe, &[&self.frame_bg, &s.composite_bg]);
 
         self.queue.submit(Some(enc.finish()));
-        self.stats = stats;
+        self.stats.draw_calls = draws;
+        self.stats.passes = passes;
     }
 
     pub fn device(&self) -> &wgpu::Device {

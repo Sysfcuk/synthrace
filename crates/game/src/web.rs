@@ -1,26 +1,46 @@
 //! SYNTHRACE browser entry point: wgpu with WebGPU→WebGL2 fallback, RAF loop driving a
-//! fixed-step simulation, keyboard/touch input, AudioWorklet synth and a debug overlay.
+//! fixed-step simulation, input, AudioWorklet synth, minimal HUD and a debug overlay.
 
 use crate::audio::Audio;
+use crate::input::Input;
 use crate::scene::Scene;
+use crate::vfx::Vfx;
 use render::Renderer;
-use sim::{DT, TUNING, World};
+use sim::{DT, SimEvent, TUNING, World};
 use std::cell::RefCell;
 use std::rc::Rc;
 use wasm_bindgen::prelude::*;
-use web_sys::{HtmlCanvasElement, HtmlElement, KeyboardEvent, PointerEvent};
+use web_sys::{HtmlCanvasElement, HtmlElement};
 
 const MAX_STEPS_PER_FRAME: u32 = 8;
+/// Traffic voices are assigned to the nearest cars within this range (m).
+const TRAFFIC_AUDIO_RANGE: f32 = 140.0;
 
-#[derive(Default)]
-struct Input {
-    left: bool,
-    right: bool,
-    up: bool,
-    down: bool,
-    touch_steer: f32,
-    touching: bool,
-    any_input: bool,
+mod dsp_param {
+    // Mirrors dsp::param (kept local to avoid linking the DSP into the game module).
+    pub const SPEED: u32 = 1;
+    pub const MUTE: u32 = 2;
+    pub const RPM: u32 = 3;
+    pub const TRAFFIC: u32 = 7;
+}
+
+mod shot {
+    // Mirrors dsp::sfx::shot.
+    pub const IMPACT: u32 = 0;
+    pub const WHOOSH: u32 = 1;
+    pub const NITRO: u32 = 2;
+    pub const SHIFT: u32 = 3;
+    pub const BLIP: u32 = 4;
+}
+
+struct Hud {
+    debug: HtmlElement,
+    speed: Option<HtmlElement>,
+    gear: Option<HtmlElement>,
+    nitro: Option<HtmlElement>,
+    callout: Option<HtmlElement>,
+    show_debug: bool,
+    callout_timer: f32,
 }
 
 struct App {
@@ -30,25 +50,31 @@ struct App {
     canvas: HtmlCanvasElement,
     backend: String,
     adapter_name: String,
-    input: Rc<RefCell<Input>>,
+    input: Input,
     audio: Rc<RefCell<Option<Audio>>>,
-    muted: Rc<RefCell<bool>>,
+    muted: bool,
     t: f64,
     last: f64,
     world: World,
     scene: Scene,
+    vfx: Vfx,
     acc: f32,
     frame_ms: Vec<f32>,
     hud_timer: f64,
-    hud: HtmlElement,
+    hud: Hud,
     last_speed_sent: f32,
+    /// Near misses in the current streak (drives the key-locked blip pitch).
+    streak: u32,
+    streak_timer: f32,
+    near_misses: u32,
+    overtakes: u32,
 }
 
 fn window() -> web_sys::Window {
     web_sys::window().expect("no window")
 }
 
-fn el(id: &str) -> Option<HtmlElement> {
+pub(crate) fn el(id: &str) -> Option<HtmlElement> {
     window().document()?.get_element_by_id(id)?.dyn_into().ok()
 }
 
@@ -128,14 +154,17 @@ async fn run() -> Result<(), String> {
     let backend = format!("{:?}", info.backend);
     log_line(&format!("SYNTHRACE boot: backend={backend} adapter='{}' surface={:?} hdr={hdr:?}", info.name, config.format));
 
-    let input = Rc::new(RefCell::new(Input::default()));
+    let input = Input::install(&canvas);
     let audio: Rc<RefCell<Option<Audio>>> = Rc::new(RefCell::new(None));
-    let muted = Rc::new(RefCell::new(false));
-    install_input(&canvas, input.clone(), audio.clone(), muted.clone());
-    install_start_button(audio.clone(), input.clone());
+    install_start_button(audio.clone(), input.state.clone());
     install_visibility(audio.clone());
 
     let now = window().performance().map(|p| p.now()).unwrap_or(0.0);
+    let show_debug = query("debug").map(|v| v != "0").unwrap_or(true);
+    let debug = el("hud").ok_or("no hud")?;
+    if !show_debug {
+        let _ = debug.style().set_property("display", "none");
+    }
     let app = Rc::new(RefCell::new(App {
         renderer,
         surface,
@@ -145,16 +174,29 @@ async fn run() -> Result<(), String> {
         adapter_name: info.name,
         input,
         audio,
-        muted,
+        muted: false,
         t: 0.0,
         last: now,
         world: World::new(query("seed").and_then(|s| s.parse().ok()).unwrap_or(1986)),
         scene: Scene::new(),
+        vfx: Vfx::new(),
         acc: 0.0,
         frame_ms: Vec::with_capacity(128),
         hud_timer: 0.0,
-        hud: el("hud").ok_or("no hud")?,
+        hud: Hud {
+            debug,
+            speed: el("hud-speed"),
+            gear: el("hud-gear"),
+            nitro: el("nitro-fill"),
+            callout: el("callout"),
+            show_debug,
+            callout_timer: 0.0,
+        },
         last_speed_sent: -1.0,
+        streak: 0,
+        streak_timer: 0.0,
+        near_misses: 0,
+        overtakes: 0,
     }));
     start_loop(app);
     Ok(())
@@ -189,22 +231,13 @@ impl App {
         self.frame_ms.push((ts - self.last) as f32);
         self.last = ts;
         self.t += dt as f64;
+        self.handle_toggles();
 
-        // --- input → fixed-step simulation (120 Hz) ---
-        let input = {
-            let i = self.input.borrow();
-            if !i.any_input {
-                sim::autopilot(&self.world, 4.5)
-            } else {
-                let steer = if i.touching { i.touch_steer } else { (i.right as i32 - i.left as i32) as f32 };
-                sim::Input {
-                    steer,
-                    throttle: if i.up || (i.touching && !i.down) { 1.0 } else { 0.0 },
-                    brake: if i.down { 1.0 } else { 0.0 },
-                }
-            }
-        };
-        self.acc += dt;
+        // --- input → fixed-step simulation (120 Hz), paused during hit-stop ---
+        let input = self.input.poll().unwrap_or_else(|| sim::autopilot(&self.world, sim::LANES[2]));
+        if self.vfx.hitstop <= 0.0 {
+            self.acc += dt;
+        }
         let mut steps = 0;
         while self.acc >= DT && steps < MAX_STEPS_PER_FRAME {
             self.world.step(&input);
@@ -214,8 +247,16 @@ impl App {
         if steps == MAX_STEPS_PER_FRAME {
             self.acc = 0.0; // drop time after a long hitch rather than spiral
         }
+        let events: Vec<SimEvent> = std::mem::take(&mut self.world.events);
+        for e in &events {
+            self.on_event(e);
+        }
+        self.vfx.update(&self.world, dt);
+        self.streak_timer -= dt;
+        if self.streak_timer <= 0.0 {
+            self.streak = 0;
+        }
         let alpha = (self.acc / DT).clamp(0.0, 1.0);
-        let speed01 = self.world.car.v / TUNING.v_max;
 
         // --- resize ---
         let (w, h) = canvas_size(&self.canvas);
@@ -228,19 +269,8 @@ impl App {
             self.renderer.resize(w, h);
         }
 
-        // --- audio params + beat clock ---
-        let beat_phase = match self.audio.borrow().as_ref() {
-            Some(a) => {
-                if (speed01 - self.last_speed_sent).abs() > 0.01 {
-                    a.set_param(dsp_param::SPEED, speed01);
-                    self.last_speed_sent = speed01;
-                }
-                a.beat_phase()
-            }
-            None => ((self.t * 118.0 / 60.0).fract()) as f32,
-        };
-
-        let params = self.scene.build(&self.world, alpha, self.t as f32, beat_phase, dt);
+        let beat_phase = self.feed_audio(&input);
+        let params = self.scene.build(&self.world, &mut self.vfx, alpha, self.t as f32, beat_phase, dt);
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(f) | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
             _ => {
@@ -252,25 +282,183 @@ impl App {
         self.renderer.render(&view, &params);
         self.renderer.queue().present(frame);
 
-        self.hud_timer += dt as f64;
-        if self.hud_timer > 0.5 {
-            self.hud_timer = 0.0;
-            self.update_hud();
+        self.update_hud(dt);
+    }
+
+    fn handle_toggles(&mut self) {
+        let (mute, debug) = {
+            let mut s = self.input.state.borrow_mut();
+            let r = (s.mute_toggled, s.debug_toggled);
+            s.mute_toggled = false;
+            s.debug_toggled = false;
+            r
+        };
+        if mute {
+            self.muted = !self.muted;
+            if let Some(a) = self.audio.borrow().as_ref() {
+                a.set_param(dsp_param::MUTE, if self.muted { 1.0 } else { 0.0 });
+            }
+        }
+        if debug {
+            self.hud.show_debug = !self.hud.show_debug;
+            let _ = self.hud.debug.style().set_property("display", if self.hud.show_debug { "block" } else { "none" });
         }
     }
 
-    fn update_hud(&mut self) {
+    fn callout(&mut self, text: &str, class: &str) {
+        if let Some(c) = &self.hud.callout {
+            c.set_inner_text(text);
+            c.set_class_name("");
+            let _ = c.offset_width(); // restart the CSS animation
+            c.set_class_name(&format!("show {class}"));
+            self.hud.callout_timer = 0.9;
+        }
+    }
+
+    fn on_event(&mut self, e: &SimEvent) {
+        self.vfx.on_event(e, &self.world);
+        let audio = self.audio.borrow();
+        let a = audio.as_ref();
+        match *e {
+            SimEvent::NearMiss { close, side, .. } => {
+                self.near_misses += 1;
+                self.streak += 1;
+                self.streak_timer = 3.0;
+                if let Some(a) = a {
+                    a.trigger(shot::WHOOSH, side);
+                    a.trigger(shot::BLIP, (self.streak - 1) as f32);
+                }
+                drop(audio);
+                if close {
+                    self.callout("CLOSE!", "hot")
+                } else {
+                    self.callout("NEAR MISS", "cool")
+                }
+                self.input.rumble(0.0, if close { 0.5 } else { 0.25 }, 80.0);
+            }
+            SimEvent::Overtake => self.overtakes += 1,
+            SimEvent::Bump { strength, .. } => {
+                if let Some(a) = a {
+                    a.trigger(shot::IMPACT, strength);
+                }
+                drop(audio);
+                self.input.rumble(0.6 * strength, 0.4, 160.0);
+            }
+            SimEvent::SpinOut | SimEvent::Crash => {
+                if let Some(a) = a {
+                    a.trigger(shot::IMPACT, 1.0);
+                }
+                drop(audio);
+                self.callout(if *e == SimEvent::Crash { "CRASH" } else { "SPIN OUT" }, "warn");
+                self.input.rumble(1.0, 1.0, 400.0);
+            }
+            SimEvent::Scrape { .. } => {
+                if let Some(a) = a {
+                    a.trigger(shot::IMPACT, 0.35);
+                }
+                drop(audio);
+                self.input.rumble(0.3, 0.6, 120.0);
+            }
+            SimEvent::DriftTier { tier } => {
+                if let Some(a) = a {
+                    a.trigger(shot::BLIP, (tier * 2) as f32);
+                }
+                drop(audio);
+                self.callout(&format!("DRIFT {}", ["", "I", "II", "III"][tier as usize]), "cool");
+            }
+            SimEvent::DriftBoost { tier } => {
+                drop(audio);
+                self.callout(&format!("BOOST {}", ["", "I", "II", "III"][tier as usize]), "hot");
+            }
+            SimEvent::NitroStart => {
+                if let Some(a) = a {
+                    a.trigger(shot::NITRO, 1.0);
+                }
+                drop(audio);
+                self.callout("NITRO", "hot");
+            }
+            SimEvent::GearShift { .. } => {
+                if let Some(a) = a {
+                    a.trigger(shot::SHIFT, 1.0);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Sends engine/tyre/traffic parameters; returns the beat phase for visuals.
+    fn feed_audio(&mut self, input: &sim::Input) -> f32 {
+        let audio = self.audio.borrow();
+        let Some(a) = audio.as_ref() else { return ((self.t * 118.0 / 60.0).fract()) as f32 };
+        let c = &self.world.car;
+        let speed01 = c.v / TUNING.v_max;
+        if (speed01 - self.last_speed_sent).abs() > 0.01 {
+            a.set_param(dsp_param::SPEED, speed01);
+            self.last_speed_sent = speed01;
+        }
+        let throttle = if c.stun > 0.0 { 0.0 } else { input.throttle };
+        a.set_params(dsp_param::RPM, &[c.rpm, throttle, c.slip, if c.nitro_active { 1.0 } else { 0.0 }]);
+
+        // Nearest four traffic cars → pass-by voices with doppler and pan.
+        let track = &self.world.track;
+        let mut near: Vec<(f32, &sim::TrafficCar)> = self
+            .world
+            .traffic
+            .cars
+            .iter()
+            .map(|t| (track.delta(t.s, c.s), t))
+            .filter(|(d, _)| d.abs() < TRAFFIC_AUDIO_RANGE)
+            .collect();
+        near.sort_by(|a, b| a.0.abs().total_cmp(&b.0.abs()));
+        let mut vals = [0.0f32; 12];
+        for (i, (ds, t)) in near.iter().take(4).enumerate() {
+            let dist = (ds * ds + (t.x - c.x) * (t.x - c.x)).sqrt();
+            let gain = (1.0 - dist / TRAFFIC_AUDIO_RANGE).max(0.0).powi(2);
+            // Closing speed toward the listener (positive = approaching).
+            let closing = (c.v - t.v) * ds.signum();
+            let doppler = (343.0 / (343.0 - closing.clamp(-120.0, 120.0))).clamp(0.7, 1.45);
+            let base = 45.0 + t.v * 2.4 + if t.kind == sim::Archetype::Truck { -20.0 } else { 0.0 };
+            vals[i * 3] = gain;
+            vals[i * 3 + 1] = base * doppler;
+            vals[i * 3 + 2] = ((t.x - c.x) / 8.0).clamp(-1.0, 1.0);
+        }
+        a.set_params(dsp_param::TRAFFIC, &vals);
+        a.beat_phase()
+    }
+
+    fn update_hud(&mut self, dt: f32) {
+        let c = &self.world.car;
+        if let Some(s) = &self.hud.speed {
+            s.set_inner_text(&format!("{:.0}", c.v * 3.6));
+        }
+        if let Some(g) = &self.hud.gear {
+            g.set_inner_text(&format!("{}", c.gear));
+        }
+        if let Some(n) = &self.hud.nitro {
+            let _ = n.style().set_property("width", &format!("{:.1}%", c.nitro));
+            n.set_class_name(if c.nitro_active { "burn" } else { "" });
+        }
+        if self.hud.callout_timer > 0.0 {
+            self.hud.callout_timer -= dt;
+        }
+
+        self.hud_timer += dt as f64;
+        if self.hud_timer < 0.5 || !self.hud.show_debug {
+            return;
+        }
+        self.hud_timer = 0.0;
         let mut v = std::mem::take(&mut self.frame_ms);
         v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let (p50, p95) = if v.is_empty() { (0.0, 0.0) } else { (v[v.len() / 2], v[((v.len() - 1) as f32 * 0.95) as usize]) };
         let audio = match self.audio.borrow().as_ref() {
-            Some(a) => format!("{} @ {} Hz{}", a.state(), a.sample_rate(), if *self.muted.borrow() { " (muted)" } else { "" }),
+            Some(a) => format!("{} @ {} Hz{}", a.state(), a.sample_rate(), if self.muted { " (muted)" } else { "" }),
             None => "not started".into(),
         };
         let s = self.renderer.stats;
         let (rw, rh) = self.renderer.size();
-        self.hud.set_inner_text(&format!(
-            "SYNTHRACE M1 · first drive\nbackend {}  ·  {}\nframe p50 {:.1} ms  p95 {:.1} ms  ({:.0} fps)\nres {}x{}  draws {}  passes {}\nhdr {:?}\nspeed {:>3.0} km/h{}\naudio {}",
+        let input_dev = self.input.state.borrow().last_device;
+        self.hud.debug.set_inner_text(&format!(
+            "SYNTHRACE M2 · speed & feel  (F3 hides)\nbackend {}  ·  {}\nframe p50 {:.1} ms  p95 {:.1} ms  ({:.0} fps)\nres {}x{}  draws {}  passes {}\ntraffic {}  particles {}\nnear misses {}  overtakes {}\ninput {}  ·  audio {}",
             self.backend,
             self.adapter_name,
             p50,
@@ -280,9 +468,11 @@ impl App {
             rh,
             s.draw_calls,
             s.passes,
-            self.renderer.hdr_format(),
-            self.world.car.v * 3.6,
-            if self.world.car.offroad { "  OFF-ROAD" } else { "" },
+            self.world.traffic.cars.len(),
+            s.particles,
+            self.near_misses,
+            self.overtakes,
+            input_dev,
             audio
         ));
         self.frame_ms = v;
@@ -290,108 +480,7 @@ impl App {
     }
 }
 
-mod dsp_param {
-    // Mirrors dsp::param (kept local to avoid linking the DSP into the game module).
-    pub const SPEED: u32 = 1;
-    pub const MUTE: u32 = 2;
-}
-
-fn install_input(
-    canvas: &HtmlCanvasElement,
-    input: Rc<RefCell<Input>>,
-    audio: Rc<RefCell<Option<Audio>>>,
-    muted: Rc<RefCell<bool>>,
-) {
-    let w = window();
-    let inp = input.clone();
-    let down = Closure::<dyn FnMut(KeyboardEvent)>::new(move |e: KeyboardEvent| {
-        let mut i = inp.borrow_mut();
-        let handled = match e.code().as_str() {
-            "ArrowLeft" | "KeyA" => {
-                i.left = true;
-                true
-            }
-            "ArrowRight" | "KeyD" => {
-                i.right = true;
-                true
-            }
-            "ArrowUp" | "KeyW" => {
-                i.up = true;
-                true
-            }
-            "ArrowDown" | "KeyS" => {
-                i.down = true;
-                true
-            }
-            "KeyM" => {
-                if !e.repeat() {
-                    let mut m = muted.borrow_mut();
-                    *m = !*m;
-                    if let Some(a) = audio.borrow().as_ref() {
-                        a.set_param(dsp_param::MUTE, if *m { 1.0 } else { 0.0 });
-                    }
-                }
-                true
-            }
-            _ => false,
-        };
-        if handled {
-            i.any_input = true;
-            e.prevent_default();
-        }
-    });
-    let inp = input.clone();
-    let up = Closure::<dyn FnMut(KeyboardEvent)>::new(move |e: KeyboardEvent| {
-        let mut i = inp.borrow_mut();
-        match e.code().as_str() {
-            "ArrowLeft" | "KeyA" => i.left = false,
-            "ArrowRight" | "KeyD" => i.right = false,
-            "ArrowUp" | "KeyW" => i.up = false,
-            "ArrowDown" | "KeyS" => i.down = false,
-            _ => {}
-        }
-    });
-    let _ = w.add_event_listener_with_callback("keydown", down.as_ref().unchecked_ref());
-    let _ = w.add_event_listener_with_callback("keyup", up.as_ref().unchecked_ref());
-    down.forget();
-    up.forget();
-
-    // Touch / pointer: hold to accelerate, horizontal position steers.
-    let c = canvas.clone();
-    let inp = input.clone();
-    let pdown = Closure::<dyn FnMut(PointerEvent)>::new(move |e: PointerEvent| {
-        let mut i = inp.borrow_mut();
-        i.touching = true;
-        i.any_input = true;
-        let width = c.client_width().max(1) as f32;
-        i.touch_steer = ((e.client_x() as f32 / width) * 2.0 - 1.0).clamp(-1.0, 1.0) * 1.4;
-        let _ = c.set_pointer_capture(e.pointer_id());
-    });
-    let c2 = canvas.clone();
-    let inp = input.clone();
-    let pmove = Closure::<dyn FnMut(PointerEvent)>::new(move |e: PointerEvent| {
-        let mut i = inp.borrow_mut();
-        if i.touching {
-            let width = c2.client_width().max(1) as f32;
-            i.touch_steer = ((e.client_x() as f32 / width) * 2.0 - 1.0).clamp(-1.0, 1.0) * 1.4;
-        }
-    });
-    let inp = input;
-    let pup = Closure::<dyn FnMut(PointerEvent)>::new(move |_e: PointerEvent| {
-        let mut i = inp.borrow_mut();
-        i.touching = false;
-        i.touch_steer = 0.0;
-    });
-    let _ = canvas.add_event_listener_with_callback("pointerdown", pdown.as_ref().unchecked_ref());
-    let _ = canvas.add_event_listener_with_callback("pointermove", pmove.as_ref().unchecked_ref());
-    let _ = canvas.add_event_listener_with_callback("pointerup", pup.as_ref().unchecked_ref());
-    let _ = canvas.add_event_listener_with_callback("pointercancel", pup.as_ref().unchecked_ref());
-    pdown.forget();
-    pmove.forget();
-    pup.forget();
-}
-
-fn install_start_button(audio: Rc<RefCell<Option<Audio>>>, input: Rc<RefCell<Input>>) {
+fn install_start_button(audio: Rc<RefCell<Option<Audio>>>, input: Rc<RefCell<crate::input::InputState>>) {
     let Some(button) = el("start") else { return };
     let b = button.clone();
     let on_click = Closure::<dyn FnMut(web_sys::Event)>::new(move |_e: web_sys::Event| {

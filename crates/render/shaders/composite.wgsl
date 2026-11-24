@@ -6,6 +6,7 @@
 struct Post {
     a: vec4f, // x = bloom strength, y = exposure, z = bloom normalisation (1/levels), w = 1 if output needs manual sRGB encode
     b: vec4f, // x = vignette, y = grain, z = chromatic aberration, w = radial blur strength
+    flash: vec4f, // rgb colour, w = intensity (impacts, checkpoints)
 }
 
 @group(1) @binding(0) var scene: texture_2d<f32>;
@@ -78,6 +79,7 @@ fn fs_composite(in: FsOut) -> @location(0) vec4f {
     let bl = textureSampleLevel(bloom, samp, uv, 0.0).rgb * post.a.z;
     c = mix(c, bl, post.a.x);
     c *= post.a.y;
+    c += post.flash.rgb * post.flash.w;
 
     var d = agx_punchy(agx(c));
 

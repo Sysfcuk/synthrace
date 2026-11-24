@@ -1,12 +1,15 @@
 //! Headless native runner for the renderer.
 //!
 //! Usage: cargo run -p desktop --release -- [--out shot.png] [--w 1920] [--h 1080]
-//!        [--t 12.5] [--s 3000] [--speed 0.8] [--x 0] [--seed 1986] [--gl] [--bench 300]
+//!        [--t 12.5] [--s 3000] [--speed 0.8] [--x 0] [--seed 1986] [--gl] [--bench 300] [--stress]
+//!        [--warm 4]  (seconds of live simulation with autopilot before the shot, so traffic and
+//!                     particles are in motion)
 //!
 //! Renders the same scene the browser does: a `sim::World` placed at track distance `--s`
 //! with speed `--speed` (fraction of top speed) and lateral position `--x`, via `game::scene`.
 
 use game::scene::Scene;
+use game::vfx::Vfx;
 use render::Renderer;
 use sim::{TUNING, World};
 use std::time::Instant;
@@ -22,6 +25,8 @@ struct Args {
     seed: u64,
     gl: bool,
     bench: u32,
+    stress: bool,
+    warm: f32,
 }
 
 fn parse() -> Args {
@@ -36,6 +41,8 @@ fn parse() -> Args {
         seed: 1986,
         gl: false,
         bench: 0,
+        stress: false,
+        warm: 0.0,
     };
     let v: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -51,6 +58,12 @@ fn parse() -> Args {
             "--x" => a.x = next(i).parse().unwrap_or(a.x),
             "--seed" => a.seed = next(i).parse().unwrap_or(a.seed),
             "--bench" => a.bench = next(i).parse().unwrap_or(0),
+            "--warm" => a.warm = next(i).parse().unwrap_or(0.0),
+            "--stress" => {
+                a.stress = true;
+                i += 1;
+                continue;
+            }
             "--gl" => {
                 a.gl = true;
                 i += 1;
@@ -110,46 +123,103 @@ fn main() {
 
     let mut world = World::new(a.seed);
     let mut scene = Scene::new();
+    let mut vfx = Vfx::new();
     let beat = |t: f32| (t * 118.0 / 60.0).fract();
+    place(&mut world, a.s, a.x, a.speed);
+    // Re-seed traffic around the new position (World::new populated it near s = 0).
+    world.traffic.cars.clear();
+    if a.stress {
+        world.traffic.row_gap = 28.0;
+    }
+    world.traffic.populate(&world.track, world.car.s, world.car.v);
+    scene.snap(&world);
+
+    // One live frame: autopilot drives (with nitro in stress mode), sim at 120 Hz, VFX updated.
+    let live_frame = |world: &mut World, vfx: &mut Vfx, stress: bool| {
+        let dt = 1.0 / 60.0;
+        for _ in 0..2 {
+            let mut input = sim::autopilot(world, sim::LANES[2]);
+            input.nitro = stress;
+            world.step(&input);
+            for e in std::mem::take(&mut world.events) {
+                vfx.on_event(&e, world);
+            }
+        }
+        if stress {
+            world.car.nitro = 100.0;
+            world.car.drift.active = true;
+            world.car.drift.tier = 2;
+            if vfx.live_particles() < 5000 {
+                vfx.debug_fill(world, 5000 - vfx.live_particles());
+            }
+        }
+        vfx.update(world, dt);
+    };
+    let warm_frames = (a.warm * 60.0) as usize;
+    for _ in 0..warm_frames {
+        live_frame(&mut world, &mut vfx, a.stress);
+    }
 
     if a.bench > 0 {
-        place(&mut world, a.s, a.x, a.speed);
-        scene.snap(&world);
         for i in 0..10 {
-            let f = scene.build(&world, 1.0, i as f32 / 60.0, 0.0, 1.0 / 60.0);
+            let f = scene.build(&world, &mut vfx, 1.0, i as f32 / 60.0, 0.0, 1.0 / 60.0);
             r.render(&view, &f);
         }
         device.poll(wgpu::PollType::wait_indefinitely()).ok();
         let mut times = Vec::new();
+        let mut sim_ms = Vec::new();
         for i in 0..a.bench {
-            let t0 = Instant::now();
             let t = i as f32 / 60.0;
-            place(&mut world, a.s + t * a.speed * TUNING.v_max, a.x, a.speed);
-            let f = scene.build(&world, 1.0, t, beat(t), 1.0 / 60.0);
+            let t0 = Instant::now();
+            live_frame(&mut world, &mut vfx, a.stress);
+            sim_ms.push(t0.elapsed().as_secs_f64() * 1000.0);
+            let f = scene.build(&world, &mut vfx, 1.0, t, beat(t), 1.0 / 60.0);
             r.render(&view, &f);
             device.poll(wgpu::PollType::wait_indefinitely()).ok();
             times.push(t0.elapsed().as_secs_f64() * 1000.0);
         }
-        times.sort_by(|x, y| x.partial_cmp(y).unwrap());
-        let pct = |p: f64| times[((times.len() as f64 - 1.0) * p) as usize];
+        let pct = |v: &mut Vec<f64>, p: f64| {
+            v.sort_by(|x, y| x.partial_cmp(y).unwrap());
+            v[((v.len() as f64 - 1.0) * p) as usize]
+        };
         println!(
-            "{}x{} frames={} p50={:.2}ms p95={:.2}ms p99={:.2}ms draws={} passes={}",
+            "{}x{} frames={} p50={:.2}ms p95={:.2}ms p99={:.2}ms (sim+vfx p95 {:.2}ms) draws={} passes={} traffic={} particles={}",
             a.w,
             a.h,
             a.bench,
-            pct(0.5),
-            pct(0.95),
-            pct(0.99),
+            pct(&mut times, 0.5),
+            pct(&mut times, 0.95),
+            pct(&mut times, 0.99),
+            pct(&mut sim_ms, 0.95),
             r.stats.draw_calls,
-            r.stats.passes
+            r.stats.passes,
+            world.traffic.cars.len(),
+            r.stats.particles
         );
     }
 
-    place(&mut world, a.s, a.x, a.speed);
-    scene.snap(&world);
-    let f = scene.build(&world, 1.0, a.t, beat(a.t), 1.0 / 60.0);
+    if warm_frames == 0 && a.bench == 0 {
+        place(&mut world, a.s, a.x, a.speed);
+        scene.snap(&world);
+    }
+    let f = scene.build(&world, &mut vfx, 1.0, a.t, beat(a.t), 1.0 / 60.0);
     r.render(&view, &f);
     save_png(&device, &queue, &target, a.w, a.h, &a.out);
+    let near: Vec<String> = world
+        .traffic
+        .cars
+        .iter()
+        .take(6)
+        .map(|c| format!("{:?} d{:.0} x{:.1}", c.kind, world.track.delta(c.s, world.car.s), c.x))
+        .collect();
+    println!(
+        "traffic {} instances {} particles {} car v {:.0} km/h  {:?}",
+        world.traffic.cars.len(),
+        r.stats.instances,
+        r.stats.particles,
+        world.car.v * 3.6,
+        near
+    );
     println!("wrote {} (hdr format {:?})", a.out, hdr);
 }
 

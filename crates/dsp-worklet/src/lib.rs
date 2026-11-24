@@ -46,6 +46,13 @@ pub extern "C" fn set_param(id: u32, value: f32) {
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn trigger(kind: u32, value: f32) {
+    if let Some(s) = synth() {
+        s.trigger(kind, value);
+    }
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn beat_phase() -> f32 {
     synth().map_or(0.0, |s| s.beat_phase())
 }

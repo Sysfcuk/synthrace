@@ -100,11 +100,11 @@ Two gates need user approval:
 
 **Acceptance criteria:**
 
-- [ ] Unit tests:
+- [x] Unit tests:
   - the spawner never produces an unpassable row, or a spawn inside the 1.2 s reaction window (property test over 10k seeds);
   - near-miss detection thresholds;
   - drift tier timings.
-- [ ] 60 fps on desktop with 40 traffic cars and 5k particles. Draw calls 150 or fewer.
+- [x] 60 fps on desktop with 40 traffic cars and 5k particles. Draw calls 150 or fewer.
 - [ ] Playable with keyboard, an Xbox/PlayStation-layout gamepad, and touch on an Android phone and an iPhone (manual checklist).
 - [ ] Engine pitch audibly follows RPM and gear changes. No clicks or pops in a 5-minute session (manual, plus an offline DSP test checking for NaN, clipping and denormals).
 - [ ] A recorded gameplay clip or screenshot sequence shows near miss, drift sparks and nitro effects.
