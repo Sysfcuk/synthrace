@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#0b0221">
+  <title>SYNTHRACE</title>
+  <link data-trunk rel="rust" href="../crates/game" data-wasm-opt="3" data-wasm-opt-params="--enable-bulk-memory --enable-nontrapping-float-to-int --enable-sign-ext --enable-mutable-globals --enable-reference-types --enable-multivalue" data-bindgen-target="web" />
+  <style>
+    html, body { margin: 0; height: 100%; background: #0b0221; overflow: hidden; }
+    canvas#game { position: fixed; inset: 0; width: 100vw; height: 100vh; display: block; touch-action: none; outline: none; }
+    #start {
+      position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; flex-direction: column;
+      background: radial-gradient(ellipse at 50% 60%, rgba(11,2,33,0.15), rgba(11,2,33,0.75));
+      font: 700 clamp(18px, 3.2vw, 34px)/1.3 ui-monospace, "Courier New", monospace; letter-spacing: 0.25em;
+      color: #ffe3f6; text-shadow: 0 0 12px #ff2e97, 0 0 28px #ff2e97; cursor: pointer; user-select: none;
+      border: 0; width: 100%;
+    }
+    #start small { font-size: 0.45em; letter-spacing: 0.2em; color: #9ff7ff; text-shadow: 0 0 10px #00f0ff; margin-top: 1.2em; }
+    #start.hidden { display: none; }
+    #hud {
+      position: fixed; left: max(8px, env(safe-area-inset-left)); top: max(8px, env(safe-area-inset-top));
+      font: 12px/1.35 ui-monospace, monospace; color: #9ff7ff; background: rgba(11,2,33,0.55);
+      padding: 6px 8px; border-radius: 4px; white-space: pre; pointer-events: none;
+    }
+    #fatal { position: fixed; inset: 0; display: none; align-items: center; justify-content: center; padding: 24px;
+      color: #ffe3f6; font: 16px/1.5 system-ui, sans-serif; text-align: center; background: #0b0221; }
+  </style>
+</head>
+<body>
+  <canvas id="game" tabindex="0"></canvas>
+  <button id="start" type="button">PRESS START<small>CLICK / TAP / ENTER · ARROWS TO DRIVE · M TO MUTE</small></button>
+  <div id="hud">booting…</div>
+  <div id="fatal"></div>
+  <noscript><div style="color:#fff;padding:2em">SYNTHRACE needs JavaScript and WebGL2.</div></noscript>
+</body>
+</html>

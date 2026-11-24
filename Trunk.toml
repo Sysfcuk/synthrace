@@ -1,0 +1,16 @@
+[build]
+target = "web/index.html"
+dist = "dist"
+release = false
+filehash = true
+
+# The AudioWorklet DSP is a separate no-bindgen cdylib, embedded into the game wasm
+# with include_bytes!, so it must be built first.
+[[hooks]]
+stage = "pre_build"
+command = "cargo"
+command_arguments = ["build", "-p", "dsp-worklet", "--release", "--target", "wasm32-unknown-unknown"]
+
+[serve]
+addresses = ["127.0.0.1"]
+port = 8080

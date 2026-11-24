@@ -1,0 +1,84 @@
+name: Deploy to GitHub Pages
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  TRUNK_VERSION: v0.22.2
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Rust toolchain (from rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: Tests
+        run: cargo test --workspace
+      - name: Install trunk
+        run: |
+          curl -sSL "https://github.com/trunk-rs/trunk/releases/download/${TRUNK_VERSION}/trunk-x86_64-unknown-linux-gnu.tar.gz" | tar -xz -C /usr/local/bin
+      - name: Build
+        run: trunk build --release --public-url /${{ github.event.repository.name }}/
+      - name: Size budget
+        run: tools/size_report.sh dist | tee -a "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    outputs:
+      page_url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v5
+
+  verify:
+    needs: deploy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: HTTP + MIME checks
+        env:
+          URL: ${{ needs.deploy.outputs.page_url }}
+        run: |
+          set -euo pipefail
+          html=$(curl -fsSL "$URL")
+          wasm=$(echo "$html" | grep -oE 'game-[0-9a-f]+_bg\.wasm' | head -1)
+          test -n "$wasm" || { echo "::error::no wasm referenced in index.html"; exit 1; }
+          ctype=$(curl -fsSI "$URL$wasm" | tr -d '\r' | awk -F': ' 'tolower($1)=="content-type"{print $2}')
+          echo "wasm $wasm content-type: $ctype"
+          [ "$ctype" = "application/wasm" ] || { echo "::error::wrong MIME type for wasm: $ctype"; exit 1; }
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+      - name: Playwright smoke test against the live site
+        working-directory: tests/e2e
+        env:
+          BASE_URL: ${{ needs.deploy.outputs.page_url }}
+        run: |
+          npm install --no-audit --no-fund
+          npx playwright install --with-deps chromium
+          npx playwright test
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: e2e-screenshots
+          path: tests/e2e/test-results

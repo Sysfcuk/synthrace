@@ -1,0 +1,15 @@
+[package]
+name = "render"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+wgpu.workspace = true
+glam.workspace = true
+bytemuck.workspace = true
+log.workspace = true
+
+[dev-dependencies]
+naga = { version = "=30.0.2", features = ["wgsl-in", "glsl-out"] }
