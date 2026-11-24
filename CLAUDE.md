@@ -11,7 +11,7 @@ Read these documents before making non-trivial changes:
 
 ## Current phase
 
-**M2 "Speed and Feel" is complete and deployed** (https://sysfcuk.github.io/synthrace/); see `docs/reviews/M2.md`. It is waiting on the user to playtest feel, gamepad, touch and audio. M3 "Arcade Loop and Adaptive Music" is next, but don't start it until the user says so. After each milestone, stop for review.
+**M2.5 (handling rework and knockable traffic) is complete and deployed**; see `docs/reviews/M2.5.md` and `docs/research/HANDLING.md`. It is waiting on the user to playtest feel. M3 "Arcade Loop and Adaptive Music" is next, but don't start it until the user says so. After each milestone, stop for review.
 
 ## Lessons learned (keep this list current)
 
@@ -23,6 +23,9 @@ Read these documents before making non-trivial changes:
 - **Traffic fairness is tested physically** (a free lateral gap of 2.5 m or more), not by lane occupancy. Cars mid-lane-change only half-block.
 - **Emissive marker codes** (`procgen::marker`, values of 50 and up) let the mesh shader light brake lights and indicators per instance. Ordinary emissive values must stay below 40.
 - **The desktop runner's `--warm N` runs the live simulation with the autopilot,** and `--stress` forces 40+ cars and about 5,000 particles for performance checks.
+- **Simulation trig must use `sim::dmath`** (deterministic polynomials), never std `sin`, `cos` or `atan2`. Native and wasm must agree bit-for-bit.
+- **Handling is heading-based** (see `docs/research/HANDLING.md`). Gameplay never moves the car sideways directly, except for collision separation.
+- **Brake-tap drift requires the throttle held.** AI and autopilot braking must stay off-throttle so they never trigger it.
 - **A hidden browser pane throttles `requestAnimationFrame`.** In-browser frame times are meaningless unless the pane is visible.
 
 ## Non-negotiable constraints

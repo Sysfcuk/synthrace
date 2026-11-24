@@ -131,6 +131,11 @@ impl Track {
         &self.segs
     }
 
+    /// Mutable segments (tests and tooling only; generation owns the shape).
+    pub fn segments_mut(&mut self) -> &mut [Segment] {
+        &mut self.segs
+    }
+
     pub fn length(&self) -> f32 {
         self.segs.len() as f32 * SEGMENT_LEN
     }

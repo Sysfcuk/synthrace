@@ -90,8 +90,45 @@ impl Vfx {
         }
     }
 
+    /// Sparks bursting from a point in track space (traffic pile-ups).
+    fn burst_at(&mut self, s: f32, x: f32, n: usize, v: f32, color: [f32; 3]) {
+        for _ in 0..n {
+            let r = &mut self.rng;
+            let p = P {
+                s: s + r.range(-1.5, 1.5),
+                x: x + r.range(-1.0, 1.0),
+                y: r.range(0.3, 1.2),
+                vs: v * r.range(0.4, 1.0),
+                vx: r.range(-7.0, 7.0),
+                vy: r.range(1.0, 7.0),
+                life: 0.0,
+                max_life: r.range(0.3, 0.9),
+                size: r.range(0.03, 0.06),
+                grow: 0.0,
+                color: [color[0] * 10.0, color[1] * 10.0, color[2] * 10.0],
+                streak: r.range(0.15, 0.4),
+                gravity: -9.8,
+            };
+            self.spawn(p);
+        }
+    }
+
     pub fn on_event(&mut self, e: &SimEvent, world: &World) {
         match *e {
+            SimEvent::Takedown { .. } => {
+                self.trauma = (self.trauma + 0.3).min(1.0);
+                self.flash = [1.0, 0.45, 0.1, 0.5];
+                self.fov_kick = self.fov_kick.max(4.0);
+                self.hitstop = self.hitstop.max(0.05);
+            }
+            SimEvent::TrafficImpact { ds, x, strength } => {
+                let s = world.track.wrap(world.car.s + ds);
+                let n = (30.0 + 90.0 * strength) as usize;
+                self.burst_at(s, x, n, world.car.v * 0.5, [1.0, 0.55, 0.2]);
+                if ds.abs() < 40.0 {
+                    self.trauma = (self.trauma + 0.12 * strength).min(1.0);
+                }
+            }
             SimEvent::Bump { strength, side } => {
                 self.trauma = (self.trauma + 0.35 * strength).min(1.0);
                 self.burst(world, 40, side, [1.0, 0.6, 0.25], 6.0);

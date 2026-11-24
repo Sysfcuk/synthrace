@@ -28,11 +28,18 @@ pub struct Instance {
     pub pos_yaw: [f32; 4],
     /// scale, roll, brake light 0..1, indicator signal (−1 left, +1 right, 0 off).
     pub scale_roll: [f32; 4],
+    /// pitch (rad, + = nose up), unused × 3.
+    pub extra: [f32; 4],
 }
 
 impl Instance {
     pub fn new(x: f32, y: f32, z: f32, yaw: f32, scale: f32, roll: f32) -> Self {
-        Self { pos_yaw: [x, y, z, yaw], scale_roll: [scale, roll, 0.0, 0.0] }
+        Self { pos_yaw: [x, y, z, yaw], scale_roll: [scale, roll, 0.0, 0.0], extra: [0.0; 4] }
+    }
+
+    pub fn with_pitch(mut self, pitch: f32) -> Self {
+        self.extra[0] = pitch;
+        self
     }
 
     pub fn with_lights(mut self, brake: f32, indicator: f32) -> Self {
@@ -56,6 +63,8 @@ pub struct Particle {
 #[derive(Clone, Copy, Debug)]
 pub struct Camera {
     pub x: f32,
+    /// Yaw (rad, + = looking right) relative to the road direction.
+    pub yaw: f32,
     pub height: f32,
     /// Pitch (rad); negative looks down.
     pub pitch: f32,
@@ -262,7 +271,7 @@ impl Renderer {
         let instance_layout = wgpu::VertexBufferLayout {
             array_stride: std::mem::size_of::<Instance>() as u64,
             step_mode: wgpu::VertexStepMode::Instance,
-            attributes: &wgpu::vertex_attr_array![4 => Float32x4, 5 => Float32x4],
+            attributes: &wgpu::vertex_attr_array![4 => Float32x4, 5 => Float32x4, 6 => Float32x4],
         };
         let mesh_pipe = pipeline(
             &device,
@@ -408,7 +417,8 @@ impl Renderer {
         let aspect = w as f32 / h as f32;
         let fov = p.camera.fov_deg.to_radians();
         let eye = Vec3::new(p.camera.x + p.fx.shake[0], p.camera.height + p.fx.shake[1], 0.0);
-        let dir = Vec3::new(0.0, p.camera.pitch.sin(), p.camera.pitch.cos());
+        let cp = p.camera.pitch.cos();
+        let dir = Vec3::new(p.camera.yaw.sin() * cp, p.camera.pitch.sin(), p.camera.yaw.cos() * cp);
         let view = Mat4::look_to_lh(eye, dir, Vec3::Y);
         let proj = Mat4::perspective_lh(fov, aspect, 0.3, 2000.0);
         let vp = proj * view;

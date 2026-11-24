@@ -68,6 +68,7 @@ struct App {
     streak_timer: f32,
     near_misses: u32,
     overtakes: u32,
+    takedowns: u32,
 }
 
 fn window() -> web_sys::Window {
@@ -197,6 +198,7 @@ async fn run() -> Result<(), String> {
         streak_timer: 0.0,
         near_misses: 0,
         overtakes: 0,
+        takedowns: 0,
     }));
     start_loop(app);
     Ok(())
@@ -337,6 +339,24 @@ impl App {
                 self.input.rumble(0.0, if close { 0.5 } else { 0.25 }, 80.0);
             }
             SimEvent::Overtake => self.overtakes += 1,
+            SimEvent::Takedown { .. } => {
+                self.takedowns += 1;
+                if let Some(a) = a {
+                    a.trigger(shot::IMPACT, 0.9);
+                    a.trigger(shot::BLIP, 6.0);
+                }
+                drop(audio);
+                self.callout("TAKEDOWN!", "hot");
+                self.input.rumble(0.7, 0.7, 250.0);
+            }
+            SimEvent::TrafficImpact { ds, strength, .. } => {
+                if let Some(a) = a {
+                    let fall = (1.0 - ds.abs() / 150.0).max(0.0);
+                    if fall > 0.05 {
+                        a.trigger(shot::IMPACT, strength * fall);
+                    }
+                }
+            }
             SimEvent::Bump { strength, .. } => {
                 if let Some(a) = a {
                     a.trigger(shot::IMPACT, strength);
@@ -458,7 +478,7 @@ impl App {
         let (rw, rh) = self.renderer.size();
         let input_dev = self.input.state.borrow().last_device;
         self.hud.debug.set_inner_text(&format!(
-            "SYNTHRACE M2 · speed & feel  (F3 hides)\nbackend {}  ·  {}\nframe p50 {:.1} ms  p95 {:.1} ms  ({:.0} fps)\nres {}x{}  draws {}  passes {}\ntraffic {}  particles {}\nnear misses {}  overtakes {}\ninput {}  ·  audio {}",
+            "SYNTHRACE M2.5 · handling  (F3 hides)\nbackend {}  ·  {}\nframe p50 {:.1} ms  p95 {:.1} ms  ({:.0} fps)\nres {}x{}  draws {}  passes {}\ntraffic {}  particles {}\nnear misses {}  overtakes {}  takedowns {}\ninput {}  ·  audio {}",
             self.backend,
             self.adapter_name,
             p50,
@@ -472,6 +492,7 @@ impl App {
             s.particles,
             self.near_misses,
             self.overtakes,
+            self.takedowns,
             input_dev,
             audio
         ));

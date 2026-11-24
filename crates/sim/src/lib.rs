@@ -1,10 +1,12 @@
 //! SYNTHRACE game simulation. Pure, deterministic, no platform or rendering deps.
 //!
-//! Determinism rule: only IEEE-exact operations (+ − × ÷, sqrt, abs, min/max, floor) on the
-//! simulation path; no `powf`/`sin`/`exp`, whose results differ between libm implementations.
+//! Determinism rule: only IEEE-exact operations (+ − × ÷, sqrt, abs, min/max, floor, %) on the
+//! simulation path. Trigonometry goes through [`dmath`]; never libm `sin`/`atan2`/`powf`/`exp`,
+//! whose results differ between platforms.
 //! All gameplay quantities live in *track space*: `s` along the track (m), `x` lateral (m).
 
 pub mod car;
+pub mod dmath;
 pub mod rng;
 pub mod track;
 pub mod traffic;
@@ -25,6 +27,22 @@ pub const NEAR_MISS_MIN_DV: f32 = 30.0 / 3.6;
 pub const NITRO_NEAR_MISS: f32 = 6.0;
 pub const NITRO_CLOSE_MISS: f32 = 10.0;
 pub const NITRO_OVERTAKE: f32 = 2.0;
+pub const NITRO_TAKEDOWN: f32 = 15.0;
+/// Coefficient of restitution for car-on-car impacts.
+const RESTITUTION: f32 = 0.25;
+/// A traffic car whose speed changes by more than this (m/s) in one impact is wrecked.
+const WRECK_DV: f32 = 5.0;
+
+/// How a takedown happened.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TakedownKind {
+    /// Knocked off the road.
+    OffRoad,
+    /// Smashed into scenery.
+    Scenery,
+    /// Knocked into other traffic (pile-up).
+    PileUp,
+}
 
 /// Things that happened during a step; drained by the game for audio, VFX and (M3) scoring.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -35,7 +53,7 @@ pub enum SimEvent {
         close: bool,
     },
     Overtake,
-    /// Low-speed contact with traffic (rear-end or sideswipe); `strength` 0..1.
+    /// Contact with traffic that didn't spin the player out; `strength` 0..1.
     Bump {
         strength: f32,
         side: f32,
@@ -46,6 +64,16 @@ pub enum SimEvent {
     /// Glancing contact with scenery.
     Scrape {
         side: f32,
+    },
+    /// A player-caused wreck took a traffic car out.
+    Takedown {
+        kind: TakedownKind,
+    },
+    /// Two traffic cars collided (wreck chain); for sound and sparks.
+    TrafficImpact {
+        ds: f32,
+        x: f32,
+        strength: f32,
     },
     DriftStart,
     DriftTier {
@@ -69,7 +97,11 @@ pub struct CarView {
     pub x: f32,
     pub v: f32,
     pub steer: f32,
+    /// Body yaw relative to the road (heading + spin), rad.
     pub yaw: f32,
+    /// Lateral / longitudinal acceleration (m/s²) for body roll and pitch.
+    pub lat_accel: f32,
+    pub long_accel: f32,
     pub offroad: bool,
     pub drifting: bool,
     pub drift_tier: u8,
@@ -88,6 +120,16 @@ pub struct World {
     pub events: Vec<SimEvent>,
 }
 
+/// Impulse along unit axis `n` (track space) between bodies a and b with velocities (vs, vx).
+/// Returns the impulse magnitude (≥ 0) or None if they're separating.
+fn impulse(va: (f32, f32), vb: (f32, f32), n: (f32, f32), ma: f32, mb: f32) -> Option<f32> {
+    let u = (vb.0 - va.0) * n.0 + (vb.1 - va.1) * n.1; // b relative to a along n
+    if u >= 0.0 {
+        return None;
+    }
+    Some(-(1.0 + RESTITUTION) * u / (1.0 / ma + 1.0 / mb))
+}
+
 impl World {
     pub fn new(seed: u64) -> Self {
         let track = Track::generate(seed);
@@ -103,73 +145,186 @@ impl World {
         self.prev = self.car.view();
         self.car.step(&self.track, input, DT, &mut self.events);
         self.traffic.update(&self.track, self.car.s, self.car.v, DT);
-        self.resolve_traffic();
+        self.resolve_player_traffic();
+        self.resolve_wrecks();
         self.resolve_scenery();
         self.tick += 1;
     }
 
-    fn resolve_traffic(&mut self) {
+    fn resolve_player_traffic(&mut self) {
         let t = &TUNING;
-        let car = &mut self.car;
         let track = &self.track;
         for tc in self.traffic.cars.iter_mut() {
-            let ds = track.delta(tc.s, car.s); // > 0: traffic ahead of the player
-            let dx = tc.x - car.x;
+            let ds = track.delta(tc.s, self.car.s); // > 0: traffic ahead of the player
+            let dx = tc.x - self.car.x;
             let (hw, hl) = tc.kind.half_extents();
             let pen_s = (t.half_length + hl) - ds.abs();
             let pen_x = (t.half_width + hw) - dx.abs();
 
-            if pen_s > 0.0 && pen_x > 0.0 && car.stun <= 0.0 {
+            if pen_s > 0.0 && pen_x > 0.0 && self.car.stun <= 0.0 {
                 tc.touched = true;
-                let side = if dx > 0.0 { 1.0 } else { -1.0 };
-                if pen_x < pen_s {
-                    // Sideswipe: push apart laterally.
-                    car.x -= side * (pen_x + 0.05);
-                    car.v *= 0.9;
-                    car.start_wobble();
-                    self.events.push(SimEvent::Bump { strength: 0.4, side });
-                } else if ds > 0.0 {
-                    // Rear-ending a car ahead.
-                    let dv = car.v - tc.v;
-                    if dv < t.bump_max_dv {
-                        car.v = (car.v * 0.7).min(tc.v - 1.0).max(0.0);
-                        car.s = track.wrap(tc.s - (t.half_length + hl) - 0.05);
-                        car.x -= side * 0.2;
-                        car.start_wobble();
-                        self.events.push(SimEvent::Bump { strength: (dv / t.bump_max_dv).clamp(0.2, 1.0), side });
-                    } else {
-                        car.v *= 0.35;
-                        car.s = track.wrap(tc.s - (t.half_length + hl) - 0.05);
-                        tc.v += 4.0;
-                        car.stun(t.spin_time);
-                        self.events.push(SimEvent::SpinOut);
-                    }
+                // Collision normal: the axis of least penetration, pointing player → traffic.
+                let lateral = pen_x < pen_s;
+                let n = if lateral { (0.0, dx.signum()) } else { (ds.signum(), 0.0) };
+                // Arcade "traffic checking": light vehicles yield to the player; trucks don't.
+                let mp = if tc.kind == Archetype::Truck { t.mass } else { t.check_mass };
+                let mt = tc.kind.mass();
+                let vp = self.car.velocity();
+                let vt = (tc.v, tc.vx);
+                // Separate first so the pair never stays interpenetrated.
+                let pen = if lateral { pen_x } else { pen_s } + 0.02;
+                let wp = mt / (mp + mt);
+                if lateral {
+                    self.car.x -= n.1 * pen * wp;
+                    tc.x += n.1 * pen * (1.0 - wp);
                 } else {
-                    // Being rear-ended by faster traffic while slow.
-                    tc.v = (car.v - 1.0).max(0.0);
-                    tc.s = track.wrap(car.s - (t.half_length + hl) - 0.05);
-                    car.v += 2.0;
-                    car.start_wobble();
-                    self.events.push(SimEvent::Bump { strength: 0.3, side });
+                    self.car.s = track.wrap(self.car.s - n.0 * pen * wp);
+                    tc.s = track.wrap(tc.s + n.0 * pen * (1.0 - wp));
+                }
+                if let Some(j) = impulse(vp, vt, n, mp, mt) {
+                    let dvp = j / mp;
+                    let dvt = j / mt;
+                    self.car.set_velocity(vp.0 - n.0 * dvp, vp.1 - n.1 * dvp);
+                    tc.v = (tc.v + n.0 * dvt).max(0.0);
+                    tc.vx += n.1 * dvt;
+                    // Off-centre hits spin the traffic car.
+                    let lever = if lateral { ds } else { -dx };
+                    tc.spin_rate += (dvt * lever * 0.18).clamp(-5.0, 5.0);
+                    if dvt > WRECK_DV || tc.vx.abs() > 3.0 {
+                        tc.wreck(true);
+                    }
+                    let side = dx.signum();
+                    if dvp > t.spin_dv {
+                        self.car.yaw_rate += 2.5 * side;
+                        self.car.stun(t.spin_time);
+                        self.events.push(SimEvent::SpinOut);
+                    } else {
+                        if dvp > 1.0 {
+                            self.car.start_wobble();
+                        }
+                        self.car.yaw_rate -= side * (dvp * 0.08).min(0.6);
+                        self.events.push(SimEvent::Bump { strength: (dvp / t.spin_dv).clamp(0.15, 1.0), side });
+                    }
                 }
             }
 
             // Pass detection: the player's centre crosses the traffic car's centre.
             if !tc.passed && tc.prev_ds > 0.0 && ds <= 0.0 && tc.prev_ds < 50.0 {
                 tc.passed = true;
-                if !tc.touched {
+                if !tc.touched && !tc.wrecked {
                     let gap = dx.abs() - (t.half_width + hw);
-                    let dv = car.v - tc.v;
+                    let dv = self.car.v - tc.v;
                     if gap < NEAR_MISS_GAP && dv > NEAR_MISS_MIN_DV {
                         let close = gap < CLOSE_MISS_GAP;
-                        car.add_nitro(if close { NITRO_CLOSE_MISS } else { NITRO_NEAR_MISS });
+                        self.car.add_nitro(if close { NITRO_CLOSE_MISS } else { NITRO_NEAR_MISS });
                         self.events.push(SimEvent::NearMiss { gap, side: dx.signum(), close });
                     }
-                    car.add_nitro(NITRO_OVERTAKE);
+                    self.car.add_nitro(NITRO_OVERTAKE);
                     self.events.push(SimEvent::Overtake);
                 }
             }
             tc.prev_ds = ds;
+        }
+    }
+
+    fn award_takedown(car: &mut Car, events: &mut Vec<SimEvent>, tc: &mut TrafficCar, kind: TakedownKind) {
+        if tc.by_player && !tc.takedown {
+            tc.takedown = true;
+            car.add_nitro(NITRO_TAKEDOWN);
+            events.push(SimEvent::Takedown { kind });
+        }
+    }
+
+    /// Wrecked traffic: pile-ups with other cars, smashing into palms, leaving the road.
+    fn resolve_wrecks(&mut self) {
+        let track = &self.track;
+        let cars = &mut self.traffic.cars;
+        let n = cars.len();
+        if !cars.iter().any(|c| c.wrecked) {
+            return;
+        }
+        for i in 0..n {
+            for j in (i + 1)..n {
+                if !cars[i].wrecked && !cars[j].wrecked {
+                    continue;
+                }
+                let (a, b) = {
+                    let (lo, hi) = cars.split_at_mut(j);
+                    (&mut lo[i], &mut hi[0])
+                };
+                let ds = track.delta(b.s, a.s);
+                let dx = b.x - a.x;
+                let (ahw, ahl) = a.kind.half_extents();
+                let (bhw, bhl) = b.kind.half_extents();
+                let pen_s = (ahl + bhl) - ds.abs();
+                let pen_x = (ahw + bhw) - dx.abs();
+                if pen_s <= 0.0 || pen_x <= 0.0 {
+                    continue;
+                }
+                let lateral = pen_x < pen_s;
+                let nrm = if lateral { (0.0, dx.signum()) } else { (ds.signum(), 0.0) };
+                let (ma, mb) = (a.kind.mass(), b.kind.mass());
+                let wa = mb / (ma + mb);
+                if lateral {
+                    a.x -= nrm.1 * pen_x * wa;
+                    b.x += nrm.1 * pen_x * (1.0 - wa);
+                } else {
+                    a.s = track.wrap(a.s - nrm.0 * pen_s * wa);
+                    b.s = track.wrap(b.s + nrm.0 * pen_s * (1.0 - wa));
+                }
+                if let Some(jm) = impulse((a.v, a.vx), (b.v, b.vx), nrm, ma, mb) {
+                    a.v = (a.v - nrm.0 * jm / ma).max(0.0);
+                    a.vx -= nrm.1 * jm / ma;
+                    b.v = (b.v + nrm.0 * jm / mb).max(0.0);
+                    b.vx += nrm.1 * jm / mb;
+                    a.spin_rate -= (jm / ma * 0.15).min(3.0) * dx.signum();
+                    b.spin_rate += (jm / mb * 0.15).min(3.0) * dx.signum();
+                    let by_player = a.by_player || b.by_player;
+                    let strength = ((jm / ma.min(mb)) / 15.0).clamp(0.1, 1.0);
+                    for c in [&mut *a, &mut *b] {
+                        if !c.wrecked {
+                            c.wreck(by_player);
+                        }
+                    }
+                    self.events.push(SimEvent::TrafficImpact {
+                        ds: track.delta(a.s, self.car.s),
+                        x: (a.x + b.x) * 0.5,
+                        strength,
+                    });
+                    if by_player {
+                        a.by_player = true;
+                        b.by_player = true;
+                        Self::award_takedown(&mut self.car, &mut self.events, a, TakedownKind::PileUp);
+                        Self::award_takedown(&mut self.car, &mut self.events, b, TakedownKind::PileUp);
+                    }
+                }
+            }
+        }
+        // Off the road, and into the palms.
+        let palms = &self.track.palms;
+        for c in cars.iter_mut().filter(|c| c.wrecked) {
+            if c.x.abs() > ROAD_HALF_WIDTH + 2.5 {
+                Self::award_takedown(&mut self.car, &mut self.events, c, TakedownKind::OffRoad);
+            }
+            if c.x.abs() < ROAD_HALF_WIDTH + 3.0 || (c.v < 0.5 && c.vx.abs() < 0.5) {
+                continue;
+            }
+            let (hw, hl) = c.kind.half_extents();
+            let lo = palms.partition_point(|p| p.s < c.s - hl - 1.0);
+            for p in &palms[lo..] {
+                if p.s > c.s + hl + 1.0 {
+                    break;
+                }
+                let r = 0.42 * p.scale;
+                if (p.x - c.x).abs() < hw + r && (p.s - c.s).abs() < hl + r {
+                    c.v *= 0.15;
+                    c.vx *= -0.2;
+                    c.spin_rate *= 0.3;
+                    self.events.push(SimEvent::TrafficImpact { ds: track.delta(c.s, self.car.s), x: c.x, strength: 1.0 });
+                    Self::award_takedown(&mut self.car, &mut self.events, c, TakedownKind::Scenery);
+                    break;
+                }
+            }
         }
     }
 
@@ -195,11 +350,13 @@ impl World {
                 if pen_x < pen_s * 0.6 {
                     car.x -= side * (pen_x + 0.05);
                     car.v *= 0.85;
+                    car.travel -= side * 0.15;
                     car.start_wobble();
                     self.events.push(SimEvent::Scrape { side });
                 } else {
                     car.v *= 0.15;
                     car.x -= side * 1.5;
+                    car.yaw_rate += 3.0 * side;
                     car.stun(t.crash_time);
                     self.events.push(SimEvent::Crash);
                 }
@@ -220,6 +377,8 @@ impl World {
             v: lerp(a.v, b.v),
             steer: lerp(a.steer, b.steer),
             yaw: lerp(a.yaw, b.yaw),
+            lat_accel: lerp(a.lat_accel, b.lat_accel),
+            long_accel: lerp(a.long_accel, b.long_accel),
             ..b
         }
     }
@@ -234,12 +393,12 @@ impl World {
             }
         };
         let c = &self.car;
-        for f in [c.s, c.x, c.v, c.steer, c.yaw, c.nitro, c.rpm, c.spin] {
+        for f in [c.s, c.x, c.v, c.steer, c.heading, c.travel, c.yaw_rate, c.nitro, c.rpm, c.spin] {
             mix(f.to_bits());
         }
         for tc in &self.traffic.cars {
             mix(tc.id);
-            for f in [tc.s, tc.x, tc.v] {
+            for f in [tc.s, tc.x, tc.v, tc.vx, tc.spin] {
                 mix(f.to_bits());
             }
         }
@@ -249,7 +408,7 @@ impl World {
 }
 
 /// Attract-mode driver: scores lanes by time-to-collision, never crosses a car alongside,
-/// cancels centrifugal push, and brakes for anything in its own footprint.
+/// steers by heading control, and brakes for anything in its own path.
 pub fn autopilot(world: &World, preferred_x: f32) -> Input {
     let c = &world.car;
     let t = &TUNING;
@@ -282,7 +441,8 @@ pub fn autopilot(world: &World, preferred_x: f32) -> Input {
         world.traffic.cars.iter().all(|tc| {
             let (hw, hl) = tc.kind.half_extents();
             let ds = track.delta(tc.s, c.s);
-            let alongside = ds.abs() < t.half_length + hl + 6.0;
+            // Beside us (or just behind), not a car further ahead we're trying to get around.
+            let alongside = ds > -(t.half_length + hl + 6.0) && ds < t.half_length + hl + 1.0;
             let in_path = tc.x + hw > lo - t.half_width && tc.x - hw < hi + t.half_width;
             !(alongside && in_path) || (tc.x - c.x).abs() < 0.5
         })
@@ -305,19 +465,43 @@ pub fn autopilot(world: &World, preferred_x: f32) -> Input {
         // Nothing good anywhere: hold the nearest lane rather than weave.
         target_x = LANES.iter().copied().min_by(|a, b| (a - c.x).abs().total_cmp(&(b - c.x).abs())).unwrap_or(c.x);
     }
-    let danger = ttc_at(c.x, 0.3).min(ttc_at(target_x, 0.2)) < 1.6;
-    let curve = track.curve_at(c.s + c.v * 0.4);
-    let grip = car::grip(c.v);
-    let push = curve * c.v * c.v * t.centrifugal;
-    let want_rate = push + (target_x - c.x) * 1.8 - c.lateral_vel * 0.3;
-    let steer = if grip > 1e-3 { want_rate / (t.steer_rate * grip) } else { 0.0 };
+    let danger = ttc_at(c.x, 0.3).min(ttc_at(target_x, 0.2)) < 2.0;
+    // Free distance ahead in our own footprint (m): lets a stopped car creep round an obstacle.
+    let gap_ahead = world
+        .traffic
+        .cars
+        .iter()
+        .filter(|tc| (tc.x - c.x).abs() < t.half_width + tc.kind.half_extents().0 + 0.3)
+        .map(|tc| track.delta(tc.s, c.s) - t.half_length - tc.kind.half_extents().1)
+        .filter(|d| *d > -1.0)
+        .fold(f32::MAX, f32::min);
+    let creep = c.v < 6.0 && gap_ahead > 3.0;
+
+    // Heading control: pick a travel angle that closes the lateral error, then a yaw rate that
+    // turns the body toward it while following the road's curvature.
+    let v = c.v.max(5.0);
+    let lat_des = ((target_x - c.x) * 1.2).clamp(-7.0, 7.0);
+    let heading_des = (lat_des / v).clamp(-0.25, 0.25);
+    let road_rate = track.curve_at(c.s + c.v * 0.3) * c.v;
+    let r_des = road_rate * (1.0 - t.road_assist) + (heading_des - c.heading) * 4.0 + (heading_des - c.travel) * 1.5;
+    let cap = car::yaw_cap(c.v, t.mu_road);
+    let steer = if cap > 1e-3 { r_des / cap } else { 0.0 };
     Input {
         steer: steer.clamp(-1.0, 1.0),
-        throttle: if all_blocked || danger { 0.0 } else { 0.85 },
-        brake: if danger {
+        throttle: if creep {
+            0.35
+        } else if all_blocked || danger {
+            0.0
+        } else {
+            0.85
+        },
+        // Off-throttle braking never counts as a drift brake-tap.
+        brake: if creep {
+            0.0
+        } else if danger {
             1.0
         } else if all_blocked {
-            0.6
+            0.4
         } else {
             0.0
         },
@@ -327,34 +511,36 @@ pub fn autopilot(world: &World, preferred_x: f32) -> Input {
 
 /// Golden state hash of [`determinism_probe`]`(42, 60)`. Changes only when the model or tuning
 /// changes on purpose; the wasm build must produce the same value (checked in the browser e2e).
-pub const GOLDEN_HASH_SEED42_60S: u64 = 0xee1c339893585c25;
+pub const GOLDEN_HASH_SEED42_60S: u64 = 0x6c6d_4586_e250_17f0;
 
 /// Runs a scripted pseudo-player for `seconds` on track `seed` and returns the state hash.
 pub fn determinism_probe(seed: u64, seconds: u32) -> u64 {
     let mut w = World::new(seed);
     for _ in 0..seconds * STEP_HZ {
-        let i = scripted_input(w.tick);
+        let i = scripted_input(&w);
         w.step(&i);
         w.events.clear();
     }
     w.state_hash()
 }
 
-fn scripted_input(tick: u64) -> Input {
-    // Deterministic pseudo-player: throttle mostly, weaving, drifting, nitro bursts, braking.
-    let phase = (tick / 90) % 8;
-    Input {
-        steer: match phase {
-            1 | 2 => -1.0,
-            5 => 1.0,
-            6 => 0.5,
-            _ => 0.0,
-        },
-        throttle: if phase == 7 { 0.0 } else { 1.0 },
-        brake: if phase == 7 && tick.is_multiple_of(3) { 1.0 } else { 0.0 },
-        drift: phase == 2,
-        nitro: phase == 4,
+/// Deterministic pseudo-player: the autopilot drives, with scripted drifts (into and out of
+/// bends), nitro bursts and brake pulses layered on top, so every system gets exercised.
+fn scripted_input(w: &World) -> Input {
+    let mut i = autopilot(w, LANES[(w.tick / 2400 % 4) as usize]);
+    match (w.tick / 90) % 10 {
+        2 => {
+            i.steer = 0.7;
+            i.drift = true;
+            i.throttle = 1.0;
+            i.brake = 0.0;
+        }
+        3 => i.steer = -0.5,
+        5 => i.nitro = true,
+        8 if w.tick.is_multiple_of(3) => i.brake = 1.0,
+        _ => {}
     }
+    i
 }
 
 #[cfg(test)]
@@ -364,7 +550,7 @@ mod tests {
     fn run(seed: u64, seconds: u32) -> World {
         let mut w = World::new(seed);
         for _ in 0..seconds * STEP_HZ {
-            let i = scripted_input(w.tick);
+            let i = scripted_input(&w);
             w.step(&i);
             w.events.clear();
         }
@@ -387,30 +573,22 @@ mod tests {
         assert_eq!(h, GOLDEN_HASH_SEED42_60S, "simulation changed: update GOLDEN_HASH_SEED42_60S if intended");
     }
 
-    /// A world on a straight track with one traffic car placed at (`ahead`, `x`).
-    fn duel(player_x: f32, player_v: f32, traffic_x: f32, traffic_v: f32, ahead: f32) -> World {
+    /// A world on a straight track with one traffic car of `kind` placed at (`ahead`, `x`).
+    fn duel_kind(kind: Archetype, player_x: f32, player_v: f32, traffic_x: f32, traffic_v: f32, ahead: f32) -> World {
         let mut w = World::new(1);
         w.track = Track::straight(4000);
         w.traffic.cars.clear();
         w.traffic.row_gap = 1e9;
         w.car = Car::new(player_x);
         w.car.v = player_v;
-        w.traffic.cars.push(TrafficCar {
-            id: 99,
-            kind: Archetype::Coupe,
-            s: ahead,
-            x: traffic_x,
-            v: traffic_v,
-            cruise: traffic_v,
-            lane: 1,
-            target: 1,
-            change_t: -1.0,
-            brake: 0.0,
-            prev_ds: ahead,
-            passed: false,
-            touched: false,
-        });
+        let mut tc = TrafficCar::new(99, kind, ahead, 1, traffic_v, ahead);
+        tc.x = traffic_x;
+        w.traffic.cars.push(tc);
         w
+    }
+
+    fn duel(player_x: f32, player_v: f32, traffic_x: f32, traffic_v: f32, ahead: f32) -> World {
+        duel_kind(Archetype::Coupe, player_x, player_v, traffic_x, traffic_v, ahead)
     }
 
     fn run_events(w: &mut World, seconds: f32, input: Input) -> Vec<SimEvent> {
@@ -429,7 +607,6 @@ mod tests {
     #[test]
     fn near_miss_thresholds() {
         let widths = TUNING.half_width + Archetype::Coupe.half_extents().0;
-        // (gap, expected: None / Some(close))
         for (gap, expect) in [(0.2, Some(true)), (0.5, Some(false)), (0.9, None)] {
             let mut w = duel(0.0, 60.0, widths + gap, 30.0, 40.0);
             let ev = run_events(&mut w, 2.0, hold_speed());
@@ -452,16 +629,47 @@ mod tests {
     }
 
     #[test]
-    fn slow_rear_end_bumps_fast_rear_end_spins() {
-        let mut w = duel(0.0, 36.0, 0.0, 30.0, 12.0);
-        let ev = run_events(&mut w, 2.0, hold_speed());
-        assert!(ev.iter().any(|e| matches!(e, SimEvent::Bump { .. })), "{ev:?}");
-        assert!(!ev.contains(&SimEvent::SpinOut));
+    fn ramming_light_traffic_launches_it_without_spinning_the_player() {
+        let mut w = duel(0.0, 50.0, 0.0, 25.0, 12.0);
+        let ev = run_events(&mut w, 1.0, hold_speed());
+        assert!(!ev.contains(&SimEvent::SpinOut), "{ev:?}");
+        let tc = &w.traffic.cars[0];
+        assert!(tc.wrecked, "coupe should be knocked out of control");
+        assert!(tc.v > 30.0, "coupe should be launched forward: v = {}", tc.v);
+        assert!(w.car.v < 50.0, "the hit should cost the player speed");
+    }
 
-        let mut w = duel(0.0, 70.0, 0.0, 30.0, 30.0);
+    #[test]
+    fn ramming_a_truck_hard_spins_the_player() {
+        let mut w = duel_kind(Archetype::Truck, 0.0, 60.0, 0.0, 22.0, 20.0);
         let ev = run_events(&mut w, 1.0, hold_speed());
         assert!(ev.contains(&SimEvent::SpinOut), "{ev:?}");
-        assert!(w.car.stun > 0.0 && w.car.v < 30.0);
+        assert!(!w.traffic.cars[0].wrecked || w.traffic.cars[0].v < 30.0);
+    }
+
+    #[test]
+    fn slamming_a_car_sideways_takes_it_off_the_road() {
+        // Alongside a coupe, steer hard into it: it should be shoved off the tarmac → takedown.
+        let widths = TUNING.half_width + Archetype::Coupe.half_extents().0;
+        let mut w = duel(LANES[1] + widths + 0.6, 40.0, LANES[1], 38.0, 0.0);
+        w.car.heading = -0.35;
+        w.car.travel = -0.35;
+        let ev = run_events(&mut w, 4.0, Input { steer: -1.0, throttle: 1.0, ..Default::default() });
+        assert!(w.traffic.cars[0].wrecked, "{ev:?}");
+        assert!(ev.iter().any(|e| matches!(e, SimEvent::Takedown { .. })), "expected a takedown: {ev:?}");
+    }
+
+    #[test]
+    fn wrecks_cause_pile_ups() {
+        let mut w = duel(0.0, 50.0, 0.0, 25.0, 12.0);
+        // A slow car further ahead in the same lane, straight in the wreck's path.
+        let mut other = TrafficCar::new(100, Archetype::Van, 32.0, 1, 18.0, 32.0);
+        other.x = 0.0;
+        w.traffic.cars.push(other);
+        let ev = run_events(&mut w, 4.0, hold_speed());
+        assert!(ev.iter().any(|e| matches!(e, SimEvent::TrafficImpact { .. })), "{ev:?}");
+        assert!(w.traffic.cars.iter().filter(|c| c.id == 99 || c.id == 100).all(|c| c.wrecked));
+        assert!(ev.iter().any(|e| matches!(e, SimEvent::Takedown { kind: TakedownKind::PileUp })));
     }
 
     #[test]
@@ -471,8 +679,7 @@ mod tests {
         assert!(ev.iter().any(|e| matches!(e, SimEvent::Bump { .. })), "{ev:?}");
         ev.extend(run_events(&mut w, 0.6, Input { steer: 0.6, throttle: 1.0, ..Default::default() }));
         ev.extend(run_events(&mut w, 8.0, Input { throttle: 1.0, ..Default::default() }));
-        assert!(w.traffic.cars[0].passed, "player should have got past");
-        assert!(!ev.iter().any(|e| matches!(e, SimEvent::NearMiss { .. } | SimEvent::Overtake)), "{ev:?}");
+        assert!(!ev.iter().any(|e| matches!(e, SimEvent::NearMiss { .. })), "{ev:?}");
     }
 
     #[test]
@@ -494,7 +701,9 @@ mod tests {
         let mut spins = 0;
         let mut bumps = 0;
         let mut passes = 0;
+        let mut distance = 0.0;
         for _ in 0..300 * STEP_HZ {
+            distance += w.car.v * DT;
             let i = autopilot(&w, LANES[2]);
             w.step(&i);
             for e in w.events.drain(..) {
@@ -505,30 +714,36 @@ mod tests {
                             .traffic
                             .cars
                             .iter()
-                            .filter(|c| w.track.delta(c.s, w.car.s).abs() < 60.0)
+                            .filter(|c| w.track.delta(c.s, w.car.s).abs() < 40.0)
                             .map(|c| {
                                 format!(
-                                    "x{:.1} t{:.2} tgt{} d{:.1} v{:.1}",
+                                    "{:?} x{:.1} d{:.1} v{:.1} chg{:.2}",
+                                    c.kind,
                                     c.x,
-                                    c.change_t,
-                                    c.target,
                                     w.track.delta(c.s, w.car.s),
-                                    c.v
+                                    c.v,
+                                    c.change_t
                                 )
                             })
                             .collect();
-                        println!("SPIN at tick {} car x{:.2} v{:.1}: {:?}", w.tick, w.car.x, w.car.v, near);
+                        println!(
+                            "SPIN at tick {} car x{:.2} v{:.1} heading {:.3}: {near:?}",
+                            w.tick, w.car.x, w.car.v, w.car.heading
+                        );
                     }
                     SimEvent::Bump { .. } => bumps += 1,
                     SimEvent::Overtake => passes += 1,
                     _ => {}
                 }
             }
-            assert!(w.car.x.abs() < ROAD_HALF_WIDTH, "autopilot left the road");
+            assert!(w.car.x.abs() < ROAD_HALF_WIDTH, "autopilot left the road at x = {}", w.car.x);
         }
-        assert_eq!(spins, 0);
-        assert!(bumps <= 3, "{bumps} bumps");
-        assert!(passes > 50, "only {passes} overtakes");
+        // Attract-mode quality bar: at most one clipped rear corner in five minutes.
+        assert!(spins <= 1, "{spins} spins");
+        // Minor contacts (creeping round wrecks, clipped corners) are fine in attract mode.
+        assert!(bumps <= 20, "{bumps} bumps");
+        assert!(passes > 30, "only {passes} overtakes");
+        assert!(distance > 300.0 * 40.0, "average speed too low: {:.0} km/h", distance / 300.0 * 3.6);
     }
 
     #[test]

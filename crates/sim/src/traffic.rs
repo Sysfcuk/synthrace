@@ -63,7 +63,22 @@ impl Archetype {
     pub fn index(self) -> usize {
         self as usize
     }
+
+    /// Mass (kg) for collision impulses.
+    pub fn mass(self) -> f32 {
+        match self {
+            Archetype::Coupe => 1300.0,
+            Archetype::Van => 2100.0,
+            Archetype::Truck => 9000.0,
+            Archetype::Sports => 1250.0,
+        }
+    }
 }
+
+/// Sliding friction for wrecked cars (m/s²) and spin damping (1/s).
+const WRECK_FRICTION: f32 = 4.5;
+const WRECK_LATERAL_FRICTION: f32 = 6.0;
+const WRECK_SPIN_DAMP: f32 = 1.2;
 
 #[derive(Clone, Debug)]
 pub struct TrafficCar {
@@ -83,9 +98,52 @@ pub struct TrafficCar {
     pub prev_ds: f32,
     pub passed: bool,
     pub touched: bool,
+    /// Lateral velocity (m/s); only non-zero while knocked about.
+    pub vx: f32,
+    /// Body rotation (rad) and its rate (rad/s) after impacts.
+    pub spin: f32,
+    pub spin_rate: f32,
+    /// Knocked out of control: no AI, slides with friction until it stops.
+    pub wrecked: bool,
+    /// The wreck was caused (directly or by chain) by the player.
+    pub by_player: bool,
+    /// A takedown has already been awarded for this car.
+    pub takedown: bool,
 }
 
 impl TrafficCar {
+    pub fn new(id: u32, kind: Archetype, s: f32, lane: u8, v: f32, prev_ds: f32) -> Self {
+        Self {
+            id,
+            kind,
+            s,
+            x: LANES[lane as usize],
+            v,
+            cruise: v,
+            lane,
+            target: lane,
+            change_t: -1.0,
+            brake: 0.0,
+            prev_ds,
+            passed: false,
+            touched: false,
+            vx: 0.0,
+            spin: 0.0,
+            spin_rate: 0.0,
+            wrecked: false,
+            by_player: false,
+            takedown: false,
+        }
+    }
+
+    /// Knock the car out of control.
+    pub fn wreck(&mut self, by_player: bool) {
+        self.wrecked = true;
+        self.by_player |= by_player;
+        self.change_t = -1.0;
+        self.brake = 0.0;
+    }
+
     /// −1 / +1 while indicating or changing toward that side; 0 otherwise.
     pub fn indicator(&self) -> f32 {
         if self.change_t >= 0.0 { (self.target as f32 - self.lane as f32).signum() } else { 0.0 }
@@ -160,6 +218,17 @@ impl Traffic {
 
         let n = self.cars.len();
         for i in 0..n {
+            if self.cars[i].wrecked {
+                let c = &mut self.cars[i];
+                c.v = (c.v - WRECK_FRICTION * dt).max(0.0);
+                let dvx = WRECK_LATERAL_FRICTION * dt;
+                c.vx = if c.vx.abs() <= dvx { 0.0 } else { c.vx - dvx * c.vx.signum() };
+                c.spin_rate -= c.spin_rate * (WRECK_SPIN_DAMP * dt).min(1.0);
+                c.spin += c.spin_rate * dt;
+                c.x = (c.x + c.vx * dt).clamp(-30.0, 30.0);
+                c.s = track.wrap(c.s + c.v * dt);
+                continue;
+            }
             // Car-following: match the speed of a slower car close ahead in our lane(s).
             let me = self.cars[i].clone();
             let (_, my_hl) = me.kind.half_extents();
@@ -170,6 +239,9 @@ impl Traffic {
             for (j, other) in self.cars.iter().enumerate() {
                 if i == j {
                     continue;
+                }
+                if other.wrecked {
+                    continue; // traffic doesn't anticipate wrecks: pile-ups happen
                 }
                 let gap = track.delta(other.s, me.s);
                 let shares = other.occupies(me.lane) || (me.change_t >= 0.0 && other.occupies(me.target));
@@ -214,11 +286,11 @@ impl Traffic {
 
         // Start new lane changes (fairness: never right in front of the player).
         for i in 0..n {
-            let (lane, change_t, kind, s) = {
+            let (lane, change_t, kind, s, wrecked) = {
                 let c = &self.cars[i];
-                (c.lane, c.change_t, c.kind, c.s)
+                (c.lane, c.change_t, c.kind, c.s, c.wrecked)
             };
-            if change_t >= 0.0 || self.rng.f32() >= kind.change_rate() * dt {
+            if wrecked || change_t >= 0.0 || self.rng.f32() >= kind.change_rate() * dt {
                 continue;
             }
             let ahead_of_player = track.delta(s, player_s);
@@ -294,21 +366,7 @@ impl Traffic {
             let closing = (player_v - v).max(1e-3);
             min_tti = min_tti.min(track.delta(s, player_s) / closing);
             occupied[lane as usize] = true;
-            self.cars.push(TrafficCar {
-                id: self.next_id,
-                kind,
-                s,
-                x: LANES[lane as usize],
-                v,
-                cruise: v,
-                lane,
-                target: lane,
-                change_t: -1.0,
-                brake: 0.0,
-                prev_ds: track.delta(s, player_s),
-                passed: false,
-                touched: false,
-            });
+            self.cars.push(TrafficCar::new(self.next_id, kind, s, lane, v, track.delta(s, player_s)));
             self.next_id += 1;
         }
         self.last_spawn = Some(RowSpawn { occupied, distance_ahead: ahead, min_tti });
@@ -403,21 +461,10 @@ mod tests {
     fn lane_changes_telegraph_for_a_second() {
         let track = Track::straight(4000);
         let mut t = Traffic::new(3);
-        t.cars.push(TrafficCar {
-            id: 1,
-            kind: Archetype::Sports,
-            s: 600.0,
-            x: LANES[1],
-            v: 30.0,
-            cruise: 30.0,
-            lane: 1,
-            target: 2,
-            change_t: 0.0,
-            brake: 0.0,
-            prev_ds: 600.0,
-            passed: false,
-            touched: false,
-        });
+        let mut c = TrafficCar::new(1, Archetype::Sports, 600.0, 1, 30.0, 600.0);
+        c.target = 2;
+        c.change_t = 0.0;
+        t.cars.push(c);
         for _ in 0..(0.9 * 60.0) as usize {
             t.update(&track, 0.0, 0.0, 1.0 / 60.0);
         }

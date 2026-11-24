@@ -7,7 +7,8 @@ struct MeshIn {
     @location(2) color: vec3f,
     @location(3) emissive: f32,
     @location(4) i_pos_yaw: vec4f,   // track-space x, y, z (camera-relative), yaw (rad)
-    @location(5) i_scale_roll: vec4f, // uniform scale, roll (rad), unused, unused
+    @location(5) i_scale_roll: vec4f, // uniform scale, roll (rad), brake, indicator
+    @location(6) i_extra: vec4f,      // pitch (rad, + = nose up)
 }
 
 struct MeshOut {
@@ -26,6 +27,12 @@ fn rot_y(v: vec3f, a: f32) -> vec3f {
     return vec3f(v.x * c + v.z * s, v.y, -v.x * s + v.z * c);
 }
 
+fn rot_x(v: vec3f, a: f32) -> vec3f {
+    let c = cos(a);
+    let s = sin(a);
+    return vec3f(v.x, v.y * c + v.z * s, -v.y * s + v.z * c);
+}
+
 fn rot_z(v: vec3f, a: f32) -> vec3f {
     let c = cos(a);
     let s = sin(a);
@@ -36,12 +43,13 @@ fn rot_z(v: vec3f, a: f32) -> vec3f {
 fn vs_mesh(in: MeshIn) -> MeshOut {
     let yaw = in.i_pos_yaw.w;
     let roll = in.i_scale_roll.y;
-    let local = rot_y(rot_z(in.pos * in.i_scale_roll.x, roll), yaw);
+    let pitch = in.i_extra.x;
+    let local = rot_y(rot_z(rot_x(in.pos * in.i_scale_roll.x, pitch), roll), yaw);
     let bent = bend(local + in.i_pos_yaw.xyz);
     var o: MeshOut;
     o.clip = frame.view_proj * vec4f(bent, 1.0);
     o.rel = bent - frame.cam.xyz;
-    o.normal = rot_y(rot_z(in.normal, roll), yaw);
+    o.normal = rot_y(rot_z(rot_x(in.normal, pitch), roll), yaw);
     o.color = in.color;
     o.emissive = in.emissive;
     o.height = local.y + in.i_pos_yaw.y;
