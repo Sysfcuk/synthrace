@@ -74,9 +74,9 @@ Two gates need user approval:
 
 - [ ] 60 fps or better (p95 frame of 16.7 ms or less) on the reference desktop at 1080p on both backends. Report checked in.
 - [ ] Driving feel: steering responds within one frame. Curves at top speed need visible counter-steer. Off-road clearly penalises. Reviewed by the user by playing the deployed build.
-- [ ] Visual: 4 reference screenshots (straight, curve, crest, dip) checked in, and they read clearly as synthwave/OutRun at a glance. **The art-direction review is with the user.**
-- [ ] Unit tests: speed, steering and centrifugal invariants; a determinism hash test over a 60 s recorded input log (native).
-- [ ] No gameplay or visual disagreement: the car's lateral position on screen matches its simulation position through curves (screenshot test at 3 curve intensities).
+- [x] Visual: 4 reference screenshots (straight, curve, crest, dip) checked in, and they read clearly as synthwave/OutRun at a glance. **The art-direction review is with the user.**
+- [x] Unit tests: speed, steering and centrifugal invariants; a determinism hash test over a 60 s recorded input log (native).
+- [x] No gameplay or visual disagreement: the car's lateral position on screen matches its simulation position through curves (screenshot test at 3 curve intensities).
 
 **Gate:** the user approves the art direction and handling baseline.
 

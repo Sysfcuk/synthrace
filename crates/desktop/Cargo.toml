@@ -8,6 +8,8 @@ publish.workspace = true
 # Dev-only native runner: headless screenshots and frame timing. Never shipped.
 [dependencies]
 render = { path = "../render" }
+sim = { path = "../sim" }
+game = { path = "../game" }
 wgpu = { workspace = true, features = ["dx12", "vulkan", "metal", "gles"] }
 pollster = "0.4"
 png = "0.18"

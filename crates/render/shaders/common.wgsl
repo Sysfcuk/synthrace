@@ -92,3 +92,12 @@ fn linear_to_srgb(c: vec3f) -> vec3f {
     let hi = 1.055 * pow(max(c, vec3f(0.0)), vec3f(1.0 / 2.4)) - 0.055;
     return select(hi, lo, c <= vec3f(0.0031308));
 }
+
+// Sky-matched distance fog shared by every surface. `rel` = position relative to the camera.
+fn apply_fog(c: vec3f, rel: vec3f, height: f32) -> vec3f {
+    let dist = length(rel);
+    let rd = rel / max(dist, 1e-3);
+    var fog = 1.0 - exp(-max(dist - 30.0, 0.0) * 0.0021);
+    fog *= 1.0 - 0.35 * smoothstep(20.0, 140.0, height);
+    return mix(c, sky_color(rd), clamp(fog, 0.0, 1.0));
+}

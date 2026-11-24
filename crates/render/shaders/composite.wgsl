@@ -34,9 +34,9 @@ fn agx(v: vec3f) -> vec3f {
 }
 
 fn agx_punchy(v: vec3f) -> vec3f {
-    let p = pow(max(v, vec3f(0.0)), vec3f(1.3));
+    let p = pow(max(v, vec3f(0.0)), vec3f(1.45));
     let luma = dot(p, vec3f(0.2126, 0.7152, 0.0722));
-    return luma + 1.35 * (p - luma);
+    return luma + 1.45 * (p - luma);
 }
 
 fn agx_eotf(v: vec3f) -> vec3f {

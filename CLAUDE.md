@@ -11,13 +11,15 @@ Read these documents before making non-trivial changes:
 
 ## Current phase
 
-**M0 (technical spikes) is implemented locally**; see `docs/reviews/M0.md`. It is waiting on the user to approve creating the GitHub repo and deploying, and on the M0 → M1 gate. Do not start a milestone until the user says so. After each milestone, stop for review.
+**M1 "First Drive" is complete and deployed** (https://sysfcuk.github.io/synthrace/); see `docs/reviews/M1.md`. It is waiting on the user to review handling feel and art direction. M2 "Speed and Feel" is next, but don't start it until the user says so. After each milestone, stop for review.
 
 ## Lessons learned (keep this list current)
 
 - **naga accepts WGSL that Chrome's Tint rejects.** For example, `a * b ^ c` needs parentheses. Always run the browser build on both backends before claiming a shader works.
 - **wasm-opt needs `--enable-bulk-memory`** and the other post-MVP feature flags for modules from Rust 1.100. These are set via `data-wasm-opt-params` in `web/index.html`.
 - **The `trunk serve` watcher doesn't always pick up changes** under `crates/render/shaders/`. Rebuild with `trunk build --release` if in doubt.
+- **The golden simulation hash** (`sim::GOLDEN_HASH_SEED42_60S`) must match between native and wasm. Any intentional change to handling or tuning changes it: update the constant and say so in the commit.
+- **The world bend is purely visual.** Visual exaggeration (`VISUAL_CURVE_GAIN` and `VISUAL_HILL_GAIN` in `game::scene`) is safe only because every drawable goes through `bend()`. Never place anything by any other route.
 - **A hidden browser pane throttles `requestAnimationFrame`.** In-browser frame times are meaningless unless the pane is visible.
 
 ## Non-negotiable constraints

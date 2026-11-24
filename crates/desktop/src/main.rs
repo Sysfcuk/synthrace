@@ -1,9 +1,14 @@
 //! Headless native runner for the renderer.
 //!
 //! Usage: cargo run -p desktop --release -- [--out shot.png] [--w 1920] [--h 1080]
-//!        [--t 12.5] [--s 3000] [--speed 0.8] [--x 0] [--gl] [--bench 300]
+//!        [--t 12.5] [--s 3000] [--speed 0.8] [--x 0] [--seed 1986] [--gl] [--bench 300]
+//!
+//! Renders the same scene the browser does: a `sim::World` placed at track distance `--s`
+//! with speed `--speed` (fraction of top speed) and lateral position `--x`, via `game::scene`.
 
-use render::{FrameParams, Renderer, demo};
+use game::scene::Scene;
+use render::Renderer;
+use sim::{TUNING, World};
 use std::time::Instant;
 
 struct Args {
@@ -14,12 +19,24 @@ struct Args {
     s: f32,
     speed: f32,
     x: f32,
+    seed: u64,
     gl: bool,
     bench: u32,
 }
 
 fn parse() -> Args {
-    let mut a = Args { out: "shot.png".into(), w: 1920, h: 1080, t: 12.5, s: 3000.0, speed: 0.8, x: 0.0, gl: false, bench: 0 };
+    let mut a = Args {
+        out: "shot.png".into(),
+        w: 1920,
+        h: 1080,
+        t: 12.5,
+        s: 3000.0,
+        speed: 0.8,
+        x: 2.25,
+        seed: 1986,
+        gl: false,
+        bench: 0,
+    };
     let v: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
     while i < v.len() {
@@ -32,6 +49,7 @@ fn parse() -> Args {
             "--s" => a.s = next(i).parse().unwrap_or(a.s),
             "--speed" => a.speed = next(i).parse().unwrap_or(a.speed),
             "--x" => a.x = next(i).parse().unwrap_or(a.x),
+            "--seed" => a.seed = next(i).parse().unwrap_or(a.seed),
             "--bench" => a.bench = next(i).parse().unwrap_or(0),
             "--gl" => {
                 a.gl = true;
@@ -43,6 +61,13 @@ fn parse() -> Args {
         i += 2;
     }
     a
+}
+
+fn place(world: &mut World, s: f32, x: f32, speed: f32) {
+    world.car.s = world.track.wrap(s);
+    world.car.x = x;
+    world.car.v = speed * TUNING.v_max;
+    world.prev = world.car.view();
 }
 
 fn main() {
@@ -83,26 +108,25 @@ fn main() {
     });
     let view = target.create_view(&Default::default());
 
-    let params = |t: f32, s: f32| FrameParams {
-        time: t,
-        scroll: s,
-        speed01: a.speed,
-        beat_phase: (t * 118.0 / 60.0).fract(),
-        player_x: a.x,
-        profile: demo::profile(s),
-    };
+    let mut world = World::new(a.seed);
+    let mut scene = Scene::new();
+    let beat = |t: f32| (t * 118.0 / 60.0).fract();
 
     if a.bench > 0 {
-        // Warm-up, then time N frames (CPU submit + GPU wait each frame).
+        place(&mut world, a.s, a.x, a.speed);
+        scene.snap(&world);
         for i in 0..10 {
-            r.render(&view, &params(i as f32 / 60.0, i as f32));
+            let f = scene.build(&world, 1.0, i as f32 / 60.0, 0.0, 1.0 / 60.0);
+            r.render(&view, &f);
         }
         device.poll(wgpu::PollType::wait_indefinitely()).ok();
         let mut times = Vec::new();
         for i in 0..a.bench {
             let t0 = Instant::now();
             let t = i as f32 / 60.0;
-            r.render(&view, &params(t, a.s + t * 80.0));
+            place(&mut world, a.s + t * a.speed * TUNING.v_max, a.x, a.speed);
+            let f = scene.build(&world, 1.0, t, beat(t), 1.0 / 60.0);
+            r.render(&view, &f);
             device.poll(wgpu::PollType::wait_indefinitely()).ok();
             times.push(t0.elapsed().as_secs_f64() * 1000.0);
         }
@@ -121,7 +145,10 @@ fn main() {
         );
     }
 
-    r.render(&view, &params(a.t, a.s));
+    place(&mut world, a.s, a.x, a.speed);
+    scene.snap(&world);
+    let f = scene.build(&world, 1.0, a.t, beat(a.t), 1.0 / 60.0);
+    r.render(&view, &f);
     save_png(&device, &queue, &target, a.w, a.h, &a.out);
     println!("wrote {} (hdr format {:?})", a.out, hdr);
 }

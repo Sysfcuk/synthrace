@@ -1,0 +1,9 @@
+[package]
+name = "procgen"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+bytemuck.workspace = true

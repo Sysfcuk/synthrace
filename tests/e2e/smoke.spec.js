@@ -10,7 +10,7 @@ test("boots on WebGL2, renders a non-black frame, starts audio, no console error
   let bootLine = "";
   page.on("console", (m) => {
     const t = m.text();
-    if (t.startsWith("SYNTHRACE M0:")) bootLine = t;
+    if (t.startsWith("SYNTHRACE boot:")) bootLine = t;
     if ((m.type() === "error" || m.type() === "warning") && !IGNORED.some((r) => r.test(t))) errors.push(t);
   });
   page.on("pageerror", (e) => errors.push(String(e)));
@@ -31,4 +31,11 @@ test("boots on WebGL2, renders a non-black frame, starts audio, no console error
   const samples = shot.data.length / (4 * 97);
   expect(lit / samples).toBeGreaterThan(0.3);
   expect(errors).toEqual([]);
+});
+
+test("wasm simulation is bit-identical to native (golden hash)", async ({ page }) => {
+  await page.goto("?backend=gl");
+  await page.waitForFunction(() => window.wasmBindings && window.wasmBindings.sim_probe_hash, null, { timeout: 30_000 });
+  const [probe, golden] = await page.evaluate(() => [window.wasmBindings.sim_probe_hash(), window.wasmBindings.sim_golden_hash()]);
+  expect(probe).toBe(golden);
 });

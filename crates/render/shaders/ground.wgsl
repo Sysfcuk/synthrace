@@ -61,8 +61,8 @@ fn fs_ground(in: GroundOut) -> @location(0) vec4f {
     // then road vs terrain is chosen with a select.
 
     // Road surface.
-    var road = vec3f(0.012, 0.008, 0.028);
-    road += vec3f(0.05, 0.01, 0.07) * value_noise(vec2f(x * 0.8, zw * 0.05)); // wet sheen streaks
+    var road = vec3f(0.006, 0.004, 0.016);
+    road += vec3f(0.025, 0.006, 0.04) * value_noise(vec2f(x * 0.8, zw * 0.05)); // wet sheen streaks
     let dash = step(fract(zw / 14.0), 0.45);
     let lanes = (line_x(x, -4.5, 0.10) + line_x(x, 4.5, 0.10)) * dash;
     road += vec3f(0.9, 0.85, 1.0) * lanes * 2.0;
@@ -84,10 +84,6 @@ fn fs_ground(in: GroundOut) -> @location(0) vec4f {
     var c = select(ground, road, ax < ROAD_HALF + 1.2);
 
     // Sky-matched fog: distant geometry melts into the horizon glow.
-    let dist = length(in.rel);
-    let rd = in.rel / max(dist, 1e-3);
-    var fog = 1.0 - exp(-dist * 0.0021);
-    fog *= 1.0 - 0.35 * smoothstep(20.0, 140.0, in.height);
-    c = mix(c, sky_color(rd), clamp(fog, 0.0, 1.0));
+    c = apply_fog(c, in.rel, in.height);
     return vec4f(c, 1.0);
 }

@@ -1,8 +1,7 @@
-//! SYNTHRACE renderer (M0 spike): Neon Bent-World ground + sky into an HDR
+//! SYNTHRACE renderer: Neon Bent-World ground, sky and instanced meshes into an HDR
 //! target, COD:AW-style bloom chain, AgX composite. Designed strictly to the
 //! WebGL2 downlevel limits so the same code runs on WebGPU and WebGL2.
 
-pub mod demo;
 pub mod shaders;
 
 use glam::{Mat4, Vec3};
@@ -15,20 +14,67 @@ const GROUND_COLS: u32 = 161;
 const GROUND_ROWS: u32 = 253;
 const GROUND_CELL_Z: f32 = 5.0;
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth24Plus;
+/// Maximum palm instances drawn per frame.
+pub const MAX_PALMS: usize = 255;
 
-/// Everything the renderer needs for one frame. Produced by the game (later: from a sim snapshot).
+/// One mesh instance in camera-relative track space (x lateral, y up, z ahead of the camera).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct Instance {
+    pub pos_yaw: [f32; 4],
+    pub scale_roll: [f32; 4],
+}
+
+impl Instance {
+    pub fn new(x: f32, y: f32, z: f32, yaw: f32, scale: f32, roll: f32) -> Self {
+        Self { pos_yaw: [x, y, z, yaw], scale_roll: [scale, roll, 0.0, 0.0] }
+    }
+}
+
+/// Chase camera, in camera-relative track space (the camera always sits at z = 0).
+#[derive(Clone, Copy, Debug)]
+pub struct Camera {
+    pub x: f32,
+    pub height: f32,
+    /// Pitch (rad); negative looks down.
+    pub pitch: f32,
+    pub fov_deg: f32,
+}
+
+/// Everything the renderer needs for one frame (built by the game from a sim snapshot).
 #[derive(Clone, Debug)]
-pub struct FrameParams {
+pub struct FrameParams<'a> {
     pub time: f32,
-    /// Distance travelled along the track (m).
+    /// Camera distance along the track (m); scrolls world-anchored patterns.
     pub scroll: f32,
-    /// Speed normalised to 0..1 (drives FOV and speed effects).
+    /// Speed normalised to 0..1 (drives speed effects).
     pub speed01: f32,
     /// Musical beat phase 0..1 (0 = on the beat).
     pub beat_phase: f32,
-    /// Player lateral position (m, track space).
-    pub player_x: f32,
+    pub camera: Camera,
     pub profile: [[f32; 2]; PROFILE_SAMPLES],
+    pub car: Instance,
+    pub palms: &'a [Instance],
+}
+
+struct GpuMesh {
+    vb: wgpu::Buffer,
+    ib: wgpu::Buffer,
+    count: u32,
+}
+
+fn upload_mesh(device: &wgpu::Device, label: &str, m: &procgen::Mesh) -> GpuMesh {
+    let vb = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some(label),
+        contents: bytemuck::cast_slice(&m.vertices),
+        usage: wgpu::BufferUsages::VERTEX,
+    });
+    let ib = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some(label),
+        contents: bytemuck::cast_slice(&m.indices),
+        usage: wgpu::BufferUsages::INDEX,
+    });
+    GpuMesh { vb, ib, count: m.indices.len() as u32 }
 }
 
 #[repr(C)]
@@ -94,6 +140,11 @@ pub struct Renderer {
     composite_bgl: wgpu::BindGroupLayout,
     ground_vb: wgpu::Buffer,
     ground_ib: wgpu::Buffer,
+    mesh_pipe: wgpu::RenderPipeline,
+    car_mesh: GpuMesh,
+    palm_mesh: GpuMesh,
+    instance_buf: wgpu::Buffer,
+    palm_count: u32,
     ground_index_count: u32,
     sized: SizedResources,
     pub stats: RenderStats,
@@ -318,6 +369,37 @@ impl Renderer {
         let down_pipe =
             pipeline(&device, "bloom down", &down_mod, "vs_fullscreen", "fs_down", &[Some(&down_bgl)], &[], hdr_format, None);
         let up_pipe = pipeline(&device, "bloom up", &up_mod, "vs_fullscreen", "fs_up", &[Some(&up_bgl)], &[], hdr_format, None);
+        let mesh_mod = shader(&device, "mesh.wgsl");
+        let mesh_layout = wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<procgen::Vertex>() as u64,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x3, 3 => Float32],
+        };
+        let instance_layout = wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<Instance>() as u64,
+            step_mode: wgpu::VertexStepMode::Instance,
+            attributes: &wgpu::vertex_attr_array![4 => Float32x4, 5 => Float32x4],
+        };
+        let mesh_pipe = pipeline(
+            &device,
+            "mesh",
+            &mesh_mod,
+            "vs_mesh",
+            "fs_mesh",
+            &[Some(&frame_bgl)],
+            &[Some(mesh_layout), Some(instance_layout)],
+            hdr_format,
+            Some(depth_test(true, wgpu::CompareFunction::Less)),
+        );
+        let car_mesh = upload_mesh(&device, "car", &procgen::car(&procgen::CAR_DEFAULT));
+        let palm_mesh = upload_mesh(&device, "palm", &procgen::palm());
+        let instance_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("instances"),
+            size: ((MAX_PALMS + 1) * std::mem::size_of::<Instance>()) as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
         let composite_pipe = pipeline(
             &device,
             "composite",
@@ -366,6 +448,11 @@ impl Renderer {
             ground_vb,
             ground_ib,
             ground_index_count: idx.len() as u32,
+            mesh_pipe,
+            car_mesh,
+            palm_mesh,
+            instance_buf,
+            palm_count: 0,
             sized,
             stats: RenderStats::default(),
         }
@@ -487,12 +574,12 @@ impl Renderer {
         );
     }
 
-    fn upload(&self, p: &FrameParams) {
+    fn upload(&mut self, p: &FrameParams) {
         let (w, h) = self.size();
         let aspect = w as f32 / h as f32;
-        let fov = (58.0 + 14.0 * p.speed01 * p.speed01).to_radians();
-        let eye = Vec3::new(p.player_x * 0.85, 2.6, 0.0);
-        let dir = Vec3::new(0.0, -0.035, 1.0).normalize();
+        let fov = p.camera.fov_deg.to_radians();
+        let eye = Vec3::new(p.camera.x, p.camera.height, 0.0);
+        let dir = Vec3::new(0.0, p.camera.pitch.sin(), p.camera.pitch.cos());
         let view = Mat4::look_to_lh(eye, dir, Vec3::Y);
         let proj = Mat4::perspective_lh(fov, aspect, 0.3, 2000.0);
         let vp = proj * view;
@@ -514,6 +601,16 @@ impl Renderer {
             b: [0.55, 0.035, 0.004 * p.speed01, 0.035 * p.speed01 * p.speed01],
         };
         self.queue.write_buffer(&self.post_ubo, 0, bytemuck::bytes_of(&pu));
+        let n = p.palms.len().min(MAX_PALMS);
+        self.queue.write_buffer(&self.instance_buf, 0, bytemuck::bytes_of(&p.car));
+        if n > 0 {
+            self.queue.write_buffer(
+                &self.instance_buf,
+                std::mem::size_of::<Instance>() as u64,
+                bytemuck::cast_slice(&p.palms[..n]),
+            );
+        }
+        self.palm_count = n as u32;
     }
 
     /// Renders one frame into `output` (a surface texture view or an offscreen target).
@@ -548,7 +645,18 @@ impl Renderer {
             pass.set_vertex_buffer(0, self.ground_vb.slice(..));
             pass.set_index_buffer(self.ground_ib.slice(..), wgpu::IndexFormat::Uint32);
             pass.draw_indexed(0..self.ground_index_count, 0, 0..1);
-            stats.draw_calls += 2;
+            pass.set_pipeline(&self.mesh_pipe);
+            pass.set_vertex_buffer(1, self.instance_buf.slice(..));
+            pass.set_vertex_buffer(0, self.car_mesh.vb.slice(..));
+            pass.set_index_buffer(self.car_mesh.ib.slice(..), wgpu::IndexFormat::Uint32);
+            pass.draw_indexed(0..self.car_mesh.count, 0, 0..1);
+            stats.draw_calls += 3;
+            if self.palm_count > 0 {
+                pass.set_vertex_buffer(0, self.palm_mesh.vb.slice(..));
+                pass.set_index_buffer(self.palm_mesh.ib.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..self.palm_mesh.count, 0, 1..1 + self.palm_count);
+                stats.draw_calls += 1;
+            }
             stats.passes += 1;
         }
 
