@@ -52,7 +52,8 @@ jobs:
 
   verify:
     needs: deploy
-    runs-on: ubuntu-latest
+    # Pinned: Playwright's browser deps track Ubuntu LTS releases.
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
       - name: HTTP + MIME checks
