@@ -43,7 +43,7 @@ Two gates need user approval:
 **Acceptance criteria:**
 
 - [ ] The public Pages URL loads and renders the sun-and-grid scene on Chrome (WebGPU), Firefox and Safari (or WebKit via Playwright), and on Chrome with WebGL2 forced.
-- [ ] The post-deploy verify job passes: wasm served with the right MIME type, non-black canvas, no console errors.
+- [x] The post-deploy verify job passes: wasm served with the right MIME type, non-black canvas, no console errors.
 - [ ] The audio spike plays without glitches for 60 s on desktop Chrome, Firefox and iOS Safari (manual), and it resumes after the tab goes to the background.
 - [x] Measured sizes are recorded in `docs/perf/M0.md`. The game WASM is **2.5 MB or less gzip** (if not, trigger the fallback in TECHNICAL_ARCHITECTURE §10).
 - [x] naga validation of every shader for the GLSL ES target runs in CI.
