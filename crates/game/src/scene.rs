@@ -2,7 +2,8 @@
 //! Platform-independent so the native `desktop` runner renders exactly what the browser does.
 
 use crate::vfx::Vfx;
-use render::{Camera, FrameParams, Fx, Instance, MAX_PALMS, MAX_TRAFFIC_PER_KIND, PROFILE_SAMPLES, PROFILE_STEP};
+use procgen::{PLAYER_WHEELS, VehicleKind, WheelSlot, wheel_layout};
+use render::{Camera, FrameParams, Fx, Instance, MAX_PALMS, MAX_TRAFFIC_PER_KIND, MAX_WHEELS, PROFILE_SAMPLES, PROFILE_STEP};
 use sim::{Archetype, DT, TUNING, World, traffic::INDICATOR_TIME};
 
 /// Distance from the camera to the car's centre along the track (m).
@@ -21,8 +22,30 @@ const PITCH_PER_G: f32 = 0.04;
 /// Suspension spring (1/s²) and damping ratio for the visual body motion.
 const BODY_SPRING: f32 = 70.0;
 const BODY_DAMPING: f32 = 0.45;
-/// How much of the car's heading the camera follows, and how fast.
-const CAM_YAW_FOLLOW: f32 = 0.35;
+/// Chase camera: how much of the car's heading it turns with, and how quickly it catches up.
+const CAM_YAW_FOLLOW: f32 = 0.7;
+const CAM_POS_RATE: f32 = 10.0;
+const CAM_YAW_RATE: f32 = 6.0;
+
+/// Visual wheel spin is capped below the six-spoke strobe limit at 60 fps (rad/s).
+const MAX_WHEEL_SPIN: f32 = 30.0;
+/// Front-wheel steering angle at full lock (rad), visual only.
+const WHEEL_STEER: f32 = 0.38;
+
+/// Wheel instances for a vehicle at (x, z) with body yaw `yaw`, spin angle and steer angle.
+fn push_wheels(out: &mut Vec<Instance>, slots: &[WheelSlot], x: f32, z: f32, yaw: f32, spin: f32, steer: f32) {
+    let (s, c) = yaw.sin_cos();
+    for w in slots {
+        if out.len() >= MAX_WHEELS {
+            return;
+        }
+        // Same rotation as the mesh shader's rot_y.
+        let ox = w.x * c + w.z * s;
+        let oz = -w.x * s + w.z * c;
+        let wheel_yaw = yaw + if w.front { steer } else { 0.0 };
+        out.push(Instance::new(x + ox, w.radius, z + oz, wheel_yaw, w.radius, 0.0).with_pitch(-spin));
+    }
+}
 
 /// Damped spring for visual body motion (gives the car a sense of mass).
 #[derive(Default, Clone, Copy)]
@@ -47,6 +70,8 @@ pub struct Scene {
     cam_yaw: f32,
     body_roll: Spring,
     body_pitch: Spring,
+    wheel_angle: f32,
+    wheels: Vec<Instance>,
     pitch: f32,
     fov: f32,
     profile: [[f32; 2]; PROFILE_SAMPLES],
@@ -67,6 +92,8 @@ impl Scene {
             cam_yaw: 0.0,
             body_roll: Spring::default(),
             body_pitch: Spring::default(),
+            wheel_angle: 0.0,
+            wheels: Vec::with_capacity(MAX_WHEELS),
             pitch: BASE_PITCH,
             fov: 60.0,
             profile: [[0.0; 2]; PROFILE_SAMPLES],
@@ -78,7 +105,7 @@ impl Scene {
     /// Snap the camera to its targets (no smoothing), e.g. for screenshots.
     pub fn snap(&mut self, world: &World) {
         let car = world.car.view();
-        self.cam_x = car.x * 0.8;
+        self.cam_x = car.x;
         self.fov = fov_for(car.v);
         self.pitch = BASE_PITCH;
     }
@@ -102,15 +129,17 @@ impl Scene {
         }
 
         // Chase camera: lags the car laterally; anticipates crests and dips.
-        let k = (dt * 6.0).min(1.0);
-        self.cam_x += (car.x * 0.8 - self.cam_x) * k;
+        // Chase camera: sits behind the car along its (partly followed) heading so the car stays
+        // centred; spin-outs don't drag the camera round.
+        let heading = if car.stunned { 0.0 } else { car.yaw.clamp(-0.6, 0.6) };
+        let yaw_target = heading * CAM_YAW_FOLLOW;
+        self.cam_yaw += (yaw_target - self.cam_yaw) * (dt * CAM_YAW_RATE).min(1.0);
+        let x_target = car.x - self.cam_yaw.sin() * CAR_Z;
+        self.cam_x += (x_target - self.cam_x) * (dt * CAM_POS_RATE).min(1.0);
         let slope = (self.profile[2][1] - self.profile[0][1]) / (2.0 * PROFILE_STEP);
         let pitch_target = BASE_PITCH + slope.atan() * 0.55;
         self.pitch += (pitch_target - self.pitch) * (dt * 3.0).min(1.0);
         self.fov += (fov_for(car.v) + vfx.fov_kick() - self.fov) * (dt * 3.0).min(1.0);
-        // The camera turns partly with the car's heading (not with spin-outs).
-        let yaw_target = if car.stunned { 0.0 } else { (car.yaw * CAM_YAW_FOLLOW).clamp(-0.3, 0.3) };
-        self.cam_yaw += (yaw_target - self.cam_yaw) * (dt * 4.0).min(1.0);
         // Weight transfer: roll out of the turn, squat under power, dive under braking.
         let g = 9.81;
         let roll = self.body_roll.step((car.lat_accel / g * ROLL_PER_G).clamp(-0.12, 0.12), dt);
@@ -127,6 +156,11 @@ impl Scene {
                 self.palms.push(Instance::new(p.x, 0.0, z, p.yaw, p.scale, p.lean));
             }
         }
+
+        // Wheels: the player's roll with speed (capped visually) and steer at the front.
+        self.wheels.clear();
+        self.wheel_angle = (self.wheel_angle + (car.v / 0.33).min(MAX_WHEEL_SPIN) * dt) % core::f32::consts::TAU;
+        push_wheels(&mut self.wheels, &PLAYER_WHEELS, car.x, CAR_Z, car.yaw, self.wheel_angle, car.steer * WHEEL_STEER);
 
         // Traffic, interpolated back from the current step like the player.
         for v in self.traffic.iter_mut() {
@@ -149,6 +183,12 @@ impl Scene {
             };
             if self.traffic[k].len() < MAX_TRAFFIC_PER_KIND {
                 self.traffic[k].push(Instance::new(x, 0.0, z, yaw, 1.0, 0.0).with_lights(tc.brake, tc.indicator()));
+                let vk = [VehicleKind::Coupe, VehicleKind::Van, VehicleKind::Truck, VehicleKind::Sports][k];
+                let slots = wheel_layout(vk);
+                let spin = time * (tc.v / slots[0].radius).min(MAX_WHEEL_SPIN) + tc.id as f32;
+                if z < 400.0 {
+                    push_wheels(&mut self.wheels, slots, x, z, yaw, spin, 0.0);
+                }
             }
         }
 
@@ -165,6 +205,7 @@ impl Scene {
             car: Instance::new(car.x, 0.0, CAR_Z, car.yaw, 1.0, roll).with_pitch(pitch),
             palms: &self.palms,
             traffic: [t0, t1, t2, t3],
+            wheels: &self.wheels,
             particles: vfx.particles(world, s_cam),
         }
     }

@@ -156,8 +156,10 @@ fn main() {
         vfx.update(world, dt);
     };
     let warm_frames = (a.warm * 60.0) as usize;
-    for _ in 0..warm_frames {
+    for i in 0..warm_frames {
         live_frame(&mut world, &mut vfx, a.stress);
+        // Keep the camera's smoothing state live, as in the browser.
+        let _ = scene.build(&world, &mut vfx, 1.0, i as f32 / 60.0, 0.0, 1.0 / 60.0);
     }
 
     if a.bench > 0 {

@@ -18,8 +18,10 @@ pub const MAX_PALMS: usize = 255;
 /// Maximum traffic instances per vehicle kind.
 pub const MAX_TRAFFIC_PER_KIND: usize = 48;
 pub const MAX_PARTICLES: usize = 6000;
+/// Maximum wheel instances per frame (player + traffic).
+pub const MAX_WHEELS: usize = 320;
 const TRAFFIC_KINDS: usize = 4;
-const MAX_INSTANCES: usize = 1 + MAX_PALMS + TRAFFIC_KINDS * MAX_TRAFFIC_PER_KIND;
+const MAX_INSTANCES: usize = 1 + MAX_PALMS + TRAFFIC_KINDS * MAX_TRAFFIC_PER_KIND + MAX_WHEELS;
 
 /// One mesh instance in camera-relative track space (x lateral, y up, z ahead of the camera).
 #[repr(C)]
@@ -99,6 +101,8 @@ pub struct FrameParams<'a> {
     pub palms: &'a [Instance],
     /// Per vehicle kind: coupe, van, truck, sports.
     pub traffic: [&'a [Instance]; TRAFFIC_KINDS],
+    /// Wheels of every vehicle (spin as pitch, steering as yaw, scale = radius).
+    pub wheels: &'a [Instance],
     pub particles: &'a [Particle],
 }
 
@@ -134,6 +138,7 @@ pub struct RenderStats {
 const SLOT_CAR: usize = 0;
 const SLOT_PALM: usize = 1;
 const SLOT_TRAFFIC: usize = 2;
+const SLOT_WHEEL: usize = SLOT_TRAFFIC + TRAFFIC_KINDS;
 
 pub struct Renderer {
     device: wgpu::Device,
@@ -335,6 +340,7 @@ impl Renderer {
             upload_mesh(&device, "van", &procgen::vehicle(V::Van)),
             upload_mesh(&device, "truck", &procgen::vehicle(V::Truck)),
             upload_mesh(&device, "sports", &procgen::vehicle(V::Sports)),
+            upload_mesh(&device, "wheel", &procgen::wheel()),
         ];
         let instance_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("instances"),
@@ -379,7 +385,7 @@ impl Renderer {
             meshes,
             instance_buf,
             particle_buf,
-            batches: vec![(0, 0); 2 + TRAFFIC_KINDS],
+            batches: vec![(0, 0); 3 + TRAFFIC_KINDS],
             particle_count: 0,
             sized,
             stats: RenderStats::default(),
@@ -455,6 +461,7 @@ impl Renderer {
         for (k, items) in p.traffic.iter().enumerate() {
             push(SLOT_TRAFFIC + k, items, MAX_TRAFFIC_PER_KIND, &mut self.batches, &mut packed);
         }
+        push(SLOT_WHEEL, p.wheels, MAX_WHEELS, &mut self.batches, &mut packed);
         self.queue.write_buffer(&self.instance_buf, 0, bytemuck::cast_slice(&packed));
         let np = p.particles.len().min(MAX_PARTICLES);
         if np > 0 {

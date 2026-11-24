@@ -40,7 +40,8 @@ pub struct Tuning {
     pub align_stunned: f32,
     /// Fraction of road curvature followed automatically (arcade assist).
     pub road_assist: f32,
-    /// Heading recentre rate (1/s) when not steering and not sliding (arcade assist).
+    /// Self-centring rate (1/s), scaled by (1 − |steer|): steering sets a heading rather than a
+    /// constant turn, so a held finger/stick means "cross at this rate" and letting go straightens.
     pub recentre: f32,
     /// Speed lost to cornering load (m/s² at the grip limit) and to sliding (m/s² at 90° slip).
     pub scrub_turn: f32,
@@ -103,12 +104,12 @@ pub const TUNING: Tuning = Tuning {
     mu_road: 1.4,
     mu_offroad: 0.8,
     mu_drift: 1.25,
-    yaw_response: 9.0,
+    yaw_response: 18.0,
     align_grip: 14.0,
     align_drift: 2.2,
     align_stunned: 0.6,
-    road_assist: 0.15,
-    recentre: 0.35,
+    road_assist: 0.6,
+    recentre: 2.5,
     scrub_turn: 1.6,
     scrub_slide: 7.0,
     max_heading: 1.0,
@@ -456,7 +457,8 @@ impl Car {
         let mut r_target = if controllable { self.steer * cap_r } else { 0.0 };
         r_target += road_rate * t.road_assist;
         if !controllable {
-            r_target = self.yaw_rate; // keep spinning / sliding as it was
+            // The visible spin is `self.spin`; physically the body just slides along with the road.
+            r_target = road_rate;
         }
         if self.drift.active {
             // Rear grip broken: the body holds a slip angle to the direction of travel —
@@ -474,9 +476,10 @@ impl Car {
         }
         self.heading += (self.yaw_rate - road_rate) * dt;
 
-        // Arcade assist: with no steering and little slip, ease the body back toward the road line.
-        if controllable && !self.drift.active && self.steer.abs() < 0.05 && slip_angle.abs() < 0.08 {
-            self.heading -= self.heading * (t.recentre * dt).min(1.0);
+        // Arcade self-centring: the less you steer, the harder the body returns to the road line.
+        if controllable && !self.drift.active {
+            let k = t.recentre * (1.0 - self.steer.abs());
+            self.heading -= self.heading * (k * dt).min(1.0);
         }
         if controllable {
             self.heading = self.heading.clamp(-t.max_heading, t.max_heading);
@@ -529,9 +532,9 @@ impl Car {
             self.stun -= dt;
             self.spin += dt * (4.0 + self.v * 0.15);
             if self.stun <= 0.0 {
-                // Regain control facing down the road the way we're now sliding.
-                self.heading = self.travel.clamp(-0.4, 0.4);
-                self.travel = self.heading;
+                // Regain control pointing (nearly) down the road.
+                self.travel = (self.travel * 0.3).clamp(-0.12, 0.12);
+                self.heading = self.travel;
                 self.yaw_rate = road_rate;
             }
         } else {
@@ -636,24 +639,34 @@ mod tests {
         let kappa = 0.0016;
         let v = TUNING.v_max;
         let needed = kappa * v * (1.0 - TUNING.road_assist) / yaw_cap(v, TUNING.mu_road);
-        assert!((0.6..0.85).contains(&needed), "hard curve needs {:.0}% steer", needed * 100.0);
+        // Arcade: the road assist carries most of the bend; the player adds about a third.
+        assert!((0.25..0.5).contains(&needed), "hard curve needs {:.0}% steer", needed * 100.0);
     }
 
     #[test]
-    fn lateral_motion_has_momentum_it_does_not_glide_to_a_stop() {
-        // Steer right briefly, then let go: the car keeps travelling right (it points that way)
-        // and needs countersteer to straighten up — it no longer stops sideways instantly.
+    fn steering_sets_a_heading_and_letting_go_straightens_up() {
         let track = straight_track();
         let mut car = Car::new(0.0);
         car.v = 50.0;
-        drive(&mut car, &track, Input { steer: 1.0, throttle: 1.0, ..Default::default() }, 0.4);
-        let x_release = car.x;
-        assert!(car.heading > 0.05, "heading {}", car.heading);
-        drive(&mut car, &track, Input { throttle: 1.0, ..Default::default() }, 0.5);
-        assert!(car.x - x_release > 2.0, "kept moving only {:.2} m", car.x - x_release);
-        // Countersteer brings the heading back.
-        drive(&mut car, &track, Input { steer: -1.0, throttle: 1.0, ..Default::default() }, 0.6);
-        assert!(car.heading < 0.05, "heading {}", car.heading);
+        // Half steer held: the car settles at a steady crossing angle instead of turning circles.
+        drive(&mut car, &track, Input { steer: 0.5, throttle: 1.0, ..Default::default() }, 1.5);
+        let h1 = car.heading;
+        drive(&mut car, &track, Input { steer: 0.5, throttle: 1.0, ..Default::default() }, 0.5);
+        assert!(h1 > 0.03 && (car.heading - h1).abs() < 0.01, "heading should settle: {h1} → {}", car.heading);
+        // Let go: it keeps a little momentum, then straightens without countersteer.
+        let x0 = car.x;
+        drive(&mut car, &track, Input { throttle: 1.0, ..Default::default() }, 1.5);
+        assert!(car.x - x0 > 0.5, "should carry some momentum");
+        assert!(car.heading.abs() < 0.02, "should straighten: {}", car.heading);
+    }
+
+    #[test]
+    fn turn_in_is_quick() {
+        let track = straight_track();
+        let mut car = Car::new(0.0);
+        car.v = 40.0;
+        drive(&mut car, &track, Input { steer: 1.0, throttle: 1.0, ..Default::default() }, 0.25);
+        assert!(car.yaw_rate > 0.8 * yaw_cap(car.v, TUNING.mu_road), "yaw {} after 250 ms", car.yaw_rate);
     }
 
     #[test]
@@ -678,7 +691,8 @@ mod tests {
         let mut car = Car::new(0.0);
         car.v = 60.0;
         drive(&mut car, &track, Input { throttle: 0.5, ..Default::default() }, 2.0);
-        assert!(car.x < -2.0, "x = {}", car.x);
+        // Runs wide, but gently: the road assist carries most of the curve.
+        assert!(car.x < -0.5 && car.x > -8.0, "x = {}", car.x);
     }
 
     #[test]

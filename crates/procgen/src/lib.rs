@@ -140,12 +140,6 @@ pub fn car(style: &CarStyle) -> Mesh {
         let (xa, xb) = if side < 0.0 { (x - 0.012, x) } else { (x, x + 0.012) };
         m.cuboid([xa, 0.50, 0.2 - zc], [xb, 0.54, 4.1 - zc], neon);
     }
-    // Wheels: octagonal prisms.
-    let tyre = Material { color: [0.012, 0.012, 0.02], emissive: 0.0 };
-    let rim = Material { color: style.neon, emissive: 1.2 };
-    for (wx, wz) in [(-0.9, 0.8), (0.9, 0.8), (-0.9, 3.55), (0.9, 3.55)] {
-        wheel(&mut m, [wx, 0.33, wz - zc], 0.33, 0.26, tyre, rim);
-    }
     m
 }
 
@@ -263,7 +257,6 @@ const VAN_STATIONS: [[f32; 6]; 6] = [
 
 pub fn vehicle(kind: VehicleKind) -> Mesh {
     let mut m = Mesh::default();
-    let tyre = Material { color: [0.012, 0.012, 0.02], emissive: 0.0 };
     let glass = Material { color: [0.015, 0.02, 0.05], emissive: 0.12 };
     match kind {
         VehicleKind::Coupe | VehicleKind::Sports => {
@@ -282,9 +275,6 @@ pub fn vehicle(kind: VehicleKind) -> Mesh {
                 let x = side * (hw + 0.004);
                 m.cuboid([x.min(x + side * 0.012), 0.46, 0.3 - zc], [x.max(x + side * 0.012), 0.49, 4.0 - zc], n);
             }
-            for (wx, wz) in [(-hw + 0.06, 0.8), (hw - 0.06, 0.8), (-hw + 0.06, 3.5), (hw - 0.06, 3.5)] {
-                wheel(&mut m, [wx, 0.32, wz - zc], 0.32, 0.24, tyre, tyre);
-            }
         }
         VehicleKind::Van => {
             let zc = 2.5;
@@ -293,9 +283,6 @@ pub fn vehicle(kind: VehicleKind) -> Mesh {
             rear_lights(&mut m, 0.98, -zc, 0.75);
             let n = Material { color: [0.1, 0.9, 0.8], emissive: 1.8 };
             m.cuboid([-0.75, 1.82, -zc - 0.03], [0.75, 1.86, -zc + 0.01], n);
-            for (wx, wz) in [(-0.97, 0.9), (0.97, 0.9), (-0.97, 4.0), (0.97, 4.0)] {
-                wheel(&mut m, [wx, 0.36, wz - zc], 0.36, 0.26, tyre, tyre);
-            }
         }
         VehicleKind::Truck => {
             let zc = 4.6;
@@ -313,37 +300,86 @@ pub fn vehicle(kind: VehicleKind) -> Mesh {
             m.cuboid([-1.2, 3.45, -zc - 0.02], [1.2, 3.52, -zc - 0.005], n);
             m.cuboid([-1.25, 0.55, -zc - 0.1], [1.25, 0.75, -zc + 0.2], Material { color: [0.05, 0.05, 0.06], emissive: 0.0 });
             rear_lights(&mut m, 1.2, -zc - 0.1, 0.8);
-            for (wx, wz) in [(-1.12, 0.8), (1.12, 0.8), (-1.12, 2.1), (1.12, 2.1), (-1.08, 7.9), (1.08, 7.9)] {
-                wheel(&mut m, [wx, 0.5, wz - zc], 0.5, 0.3, tyre, tyre);
-            }
         }
     }
     m
 }
 
-fn wheel(m: &mut Mesh, c: V3, r: f32, w: f32, tyre: Material, rim: Material) {
-    let n = 8;
-    let outer = if c[0] < 0.0 { -1.0 } else { 1.0 };
-    let pt = |k: usize, x: f32| -> V3 {
+/// One wheel slot: local (x, z) of the axle centre and the wheel radius (m).
+#[derive(Clone, Copy, Debug)]
+pub struct WheelSlot {
+    pub x: f32,
+    pub z: f32,
+    pub radius: f32,
+    /// Front wheels turn with the steering.
+    pub front: bool,
+}
+
+const fn ws(x: f32, z: f32, radius: f32, front: bool) -> WheelSlot {
+    WheelSlot { x, z, radius, front }
+}
+
+/// Player car wheel layout (car origin at the centre of its length).
+pub const PLAYER_WHEELS: [WheelSlot; 4] =
+    [ws(-0.9, -1.425, 0.33, false), ws(0.9, -1.425, 0.33, false), ws(-0.9, 1.325, 0.33, true), ws(0.9, 1.325, 0.33, true)];
+
+/// Wheel layout for each traffic archetype.
+pub fn wheel_layout(kind: VehicleKind) -> &'static [WheelSlot] {
+    const COUPE: [WheelSlot; 4] =
+        [ws(-0.86, -1.4, 0.32, false), ws(0.86, -1.4, 0.32, false), ws(-0.86, 1.3, 0.32, true), ws(0.86, 1.3, 0.32, true)];
+    const SPORTS: [WheelSlot; 4] =
+        [ws(-0.89, -1.4, 0.32, false), ws(0.89, -1.4, 0.32, false), ws(-0.89, 1.3, 0.32, true), ws(0.89, 1.3, 0.32, true)];
+    const VAN: [WheelSlot; 4] =
+        [ws(-0.97, -1.6, 0.36, false), ws(0.97, -1.6, 0.36, false), ws(-0.97, 1.5, 0.36, true), ws(0.97, 1.5, 0.36, true)];
+    const TRUCK: [WheelSlot; 6] = [
+        ws(-1.12, -3.8, 0.5, false),
+        ws(1.12, -3.8, 0.5, false),
+        ws(-1.12, -2.5, 0.5, false),
+        ws(1.12, -2.5, 0.5, false),
+        ws(-1.08, 3.3, 0.5, true),
+        ws(1.08, 3.3, 0.5, true),
+    ];
+    match kind {
+        VehicleKind::Coupe => &COUPE,
+        VehicleKind::Sports => &SPORTS,
+        VehicleKind::Van => &VAN,
+        VehicleKind::Truck => &TRUCK,
+    }
+}
+
+/// Unit wheel (radius 1, width 0.75) spinning about the x axis: dark tyre with a neon
+/// six-spoke rim on both faces so rotation is visible. Instances scale it to the real radius.
+pub fn wheel() -> Mesh {
+    let mut m = Mesh::default();
+    let tyre = Material { color: [0.012, 0.012, 0.02], emissive: 0.0 };
+    let sidewall = Material { color: [0.03, 0.03, 0.045], emissive: 0.0 };
+    let spoke = Material { color: [0.05, 0.85, 1.0], emissive: 1.6 };
+    let hub = Material { color: [0.02, 0.02, 0.03], emissive: 0.0 };
+    let n = 12;
+    let half_w = 0.375;
+    let pt = |k: usize, x: f32, r: f32| -> V3 {
         let a = k as f32 / n as f32 * TAU;
-        [x, c[1] + r * a.cos(), c[2] + r * a.sin()]
+        [x, r * a.cos(), r * a.sin()]
     };
-    let (xi, xo) = (c[0] - outer * w * 0.5, c[0] + outer * w * 0.5);
     for k in 0..n {
         let k2 = (k + 1) % n;
-        if outer > 0.0 {
-            m.quad(pt(k, xi), pt(k2, xi), pt(k2, xo), pt(k, xo), tyre);
-        } else {
-            m.quad(pt(k, xo), pt(k2, xo), pt(k2, xi), pt(k, xi), tyre);
-        }
-        // Outer face with a thin glowing rim ring.
-        let hub = [xo, c[1], c[2]];
-        if outer > 0.0 {
-            m.tri(hub, pt(k, xo), pt(k2, xo), if k % 2 == 0 { rim } else { tyre });
-        } else {
-            m.tri(hub, pt(k2, xo), pt(k, xo), if k % 2 == 0 { rim } else { tyre });
+        // Tread.
+        m.quad(pt(k, -half_w, 1.0), pt(k2, -half_w, 1.0), pt(k2, half_w, 1.0), pt(k, half_w, 1.0), tyre);
+        for (x, outward) in [(half_w, 1.0f32), (-half_w, -1.0)] {
+            // Sidewall ring (r 0.72..1) and rim disc with alternating spokes.
+            let (a, b, c, d) = (pt(k, x, 1.0), pt(k2, x, 1.0), pt(k2, x, 0.72), pt(k, x, 0.72));
+            let centre = [x, 0.0, 0.0];
+            let rim = if k % 2 == 0 { spoke } else { hub };
+            if outward > 0.0 {
+                m.quad(a, d, c, b, sidewall);
+                m.tri(centre, d, c, rim);
+            } else {
+                m.quad(a, b, c, d, sidewall);
+                m.tri(centre, c, d, rim);
+            }
         }
     }
+    m
 }
 
 /// Palm tree: curved hexagonal trunk with ring bumps and nine drooping V-folded fronds.
@@ -471,6 +507,20 @@ mod tests {
             assert!(m.vertices.iter().any(|v| v.emissive == marker::BRAKE));
             assert!(m.vertices.iter().any(|v| v.emissive == marker::INDICATOR_LEFT));
         }
+    }
+
+    #[test]
+    fn wheel_is_unit_sized_and_layouts_sit_inside_the_body() {
+        let w = wheel();
+        check(&w);
+        let (lo, hi) = w.bounds();
+        assert!((hi[1] - 1.0).abs() < 1e-3 && (lo[1] + 1.0).abs() < 0.02);
+        assert!(w.vertices.iter().any(|v| v.emissive > 1.0), "spokes should glow so rotation reads");
+        for kind in [VehicleKind::Coupe, VehicleKind::Van, VehicleKind::Truck, VehicleKind::Sports] {
+            let slots = wheel_layout(kind);
+            assert!(slots.len() >= 4 && slots.iter().any(|s| s.front));
+        }
+        assert_eq!(PLAYER_WHEELS.iter().filter(|s| s.front).count(), 2);
     }
 
     #[test]

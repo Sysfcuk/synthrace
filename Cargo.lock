@@ -263,6 +263,7 @@ dependencies = [
  "console_error_panic_hook",
  "js-sys",
  "log",
+ "procgen",
  "render",
  "sim",
  "wasm-bindgen",
